@@ -10,6 +10,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { knownContextWindow } from "./context.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const INSTALL_ROOT = path.resolve(__dirname, "..", "..");
@@ -123,11 +124,17 @@ const DEFAULT_SETTINGS = {
     modelsDir: "C:\\models",
     host: "127.0.0.1",
     port: 8080,
-    contextSize: 8192,
+    // "auto" (or 0) = load the model's full trained context from the GGUF
+    // header, capped at maxAutoContext to bound RAM/VRAM.
+    contextSize: "auto",
+    maxAutoContext: 131072,
     ngl: 99,
     defaultModel: "",
     extraArgs: [],
   },
+  // maxTokens is the per-response OUTPUT cap (sent as max_tokens).
+  // contextWindow is the model's full context size; omit it to auto-detect
+  // (provider metadata, then a known-family table). Override with /context.
   models: {
     "openai/gpt-4.1": { provider: "openai", id: "gpt-4.1", maxTokens: 16384 },
     "openai/gpt-4.1-mini": { provider: "openai", id: "gpt-4.1-mini", maxTokens: 16384 },
@@ -217,6 +224,14 @@ function migrateSettings(settings) {
     settings.providers.nvidia.api ||= "openai-completions";
     delete settings.providers.nvidia.reasoningParam;
   }
+  // Old shipped default capped local context at 8192; "auto" reads the model's
+  // trained context from the GGUF header instead (see llama.mjs).
+  if (settings.llama && settings.llama.contextSize === 8192) {
+    settings.llama.contextSize = "auto";
+  }
+  if (settings.llama && !settings.llama.maxAutoContext) {
+    settings.llama.maxAutoContext = 131072;
+  }
   return settings;
 }
 
@@ -279,10 +294,13 @@ export function resolveModel(settings, modelKey) {
   if (!m) throw new Error(`Unknown model "${key}". Known: ${Object.keys(settings.models).join(", ")}`);
   const provider = settings.providers[m.provider];
   if (!provider) throw new Error(`Provider "${m.provider}" not configured.`);
+  const ctxWin = knownContextWindow(m, m.id);
   return {
     key,
     id: m.id,
     maxTokens: m.maxTokens || 8192,
+    contextWindow: ctxWin.size,
+    contextWindowSource: ctxWin.source,
     provider,
     providerName: m.provider,
     providerLabel: provider.label || m.provider,
@@ -320,11 +338,23 @@ export class Session {
     const ts = new Date().toISOString().replace(/[:.]/g, "-");
     this.file = path.join(dir, `${ts}.jsonl`);
     this._cost = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+    this._contextTokens = 0; // tokens in the CURRENT conversation (last request)
     this.append({ type: "session_start", cwd: process.cwd(), time: new Date().toISOString() });
   }
 
   get totalTokens() {
     return this._cost.totalTokens;
+  }
+
+  // Size of the live conversation: prompt + completion of the most recent
+  // request. Unlike totalTokens (cumulative spend), this is what counts
+  // against the model's context window.
+  get contextTokens() {
+    return this._contextTokens;
+  }
+
+  setContextTokens(n) {
+    if (Number.isFinite(n) && n >= 0) this._contextTokens = n;
   }
 
   async append(record) {
@@ -340,6 +370,8 @@ export class Session {
     this._cost.promptTokens += usage.prompt_tokens || 0;
     this._cost.completionTokens += usage.completion_tokens || 0;
     this._cost.totalTokens += usage.total_tokens || 0;
+    const ctx = (usage.prompt_tokens || 0) + (usage.completion_tokens || 0);
+    if (ctx > 0) this._contextTokens = ctx;
   }
 
   get cost() {
@@ -348,6 +380,7 @@ export class Session {
 
   resetCost() {
     this._cost = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+    this._contextTokens = 0;
   }
 
   // Find the most recent session file for the current cwd

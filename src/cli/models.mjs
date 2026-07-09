@@ -3,6 +3,7 @@
 
 import { c, infoLine, warnLine, errorLine } from "../ui.mjs";
 import { saveSettings, resolveModel, providerKeyMissing, providerKeyEnvVar } from "../core/config.mjs";
+import { detectContextWindow, formatContextSize } from "../core/context.mjs";
 import { listProviderModels, probeModel } from "../core/provider.mjs";
 import * as llama from "../local/llama.mjs";
 import { maskKey, normalizeProviderKey, modelKeyFor, trimHealthMessage } from "./helpers.mjs";
@@ -182,7 +183,8 @@ export async function ensureLocalModelStarted(ctx, selectedModel = ctx.model) {
     ...(ctx.settings.models["local/coder"] || {}),
     provider: "local",
     id: info.model,
-    maxTokens: info.contextSize || ctx.settings.models["local/coder"]?.maxTokens || 8192,
+    maxTokens: ctx.settings.models["local/coder"]?.maxTokens || 8192,
+    contextWindowDetected: info.contextSize || undefined,
   };
   ctx.settings.llama = { ...(ctx.settings.llama || {}), defaultModel: info.model };
   await saveSettings(ctx.settings);
@@ -234,7 +236,11 @@ export async function switchModel(ctx, keyOrIndex) {
     }
   }
   await ensureLocalModelStarted(ctx, ctx.model);
-  infoLine(`switched to ${ctx.model.key} (${ctx.model.providerLabel}, effort=${ctx.model.reasoning})`);
+  // Pick up anything ensureLocalModelStarted persisted (e.g. the loaded
+  // context size), then refresh the window from provider metadata.
+  try { ctx.model = resolveModel(ctx.settings, ctx.model.key); } catch { /* keep current */ }
+  await detectContextWindow(ctx).catch(() => {});
+  infoLine(`switched to ${ctx.model.key} (${ctx.model.providerLabel}, effort=${ctx.model.reasoning}, ctx=${formatContextSize(ctx.model.contextWindow)})`);
 }
 
 function renderModelPicker(ctx, rows, selected, providerName) {

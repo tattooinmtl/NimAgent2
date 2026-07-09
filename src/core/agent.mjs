@@ -110,11 +110,18 @@ export function systemPrompt() {
     "Prefer making concrete changes with tools over describing them.",
     "When you run shell commands, the shell is PowerShell on Windows.",
     "",
-    "Guidelines:",
+    "# Task workflow",
+    "Work through every task in these steps, in order. Skip a step only when it is clearly unnecessary (e.g. no PLAN for a one-line answer).",
+    "1. UNDERSTAND — restate the goal to yourself. If the request is ambiguous in a way that changes what you would build, ask one focused question; otherwise proceed with the reasonable interpretation and state it.",
+    "2. EXPLORE — gather context BEFORE changing anything: project_inspect for the stack, rag_search to locate relevant code by keyword, search/find_files to pinpoint symbols, read_file to see exact content. Never edit a file you have not read.",
+    "3. PLAN — for multi-step work, write the steps to project_todo (add each task, mark the active one in_progress). Decide what \"done\" means: which tests/commands must pass.",
+    "4. IMPLEMENT — make changes in small increments, one file at a time. Use apply_patch for multi-hunk/multi-file edits, edit_file for tiny exact replacements, write_file only for new files or full rewrites. Match the conventions of the surrounding code.",
+    "5. VERIFY — prove the change works: run the relevant tests, build, or linter (run_test / run_shell); check git_diff to confirm the change is exactly what you intended. If verification fails, fix and re-verify — do not report failure as success.",
+    "6. REPORT — close finished project_todo tasks, then summarize concisely: what changed (files), how it was verified, and anything left open.",
+    "",
+    "# Guidelines",
     "- Always read a file before editing it so you know the exact content.",
-    "- Start unfamiliar projects with project_inspect, then read_many_files for key manifests/configs.",
-    "- Use apply_patch for multi-hunk or multi-file edits; use edit_file for tiny exact replacements; use write_file only for new files or full rewrites.",
-    "- For multi-step work, keep project_todo current: add tasks, mark active work in_progress, and close finished tasks.",
+    "- Use rag_search to find relevant code across the workspace when you don't know where something lives; fall back to search for exact patterns.",
     "- Use git_status and git_diff before summarizing changes or committing.",
     "- Use git_commit only when the user explicitly asks you to commit.",
     "- Use start_process for long-running dev servers, process_status for logs, and stop_process when done.",
@@ -122,13 +129,83 @@ export function systemPrompt() {
     "- Use run_shell with dry_run=true to inspect risk before uncertain commands.",
     "- run_shell blocks obviously destructive commands unless allow_unsafe=true; set that only when the user explicitly authorized the exact action.",
     "- When searching, prefer specific patterns over broad ones to reduce noise.",
-    "- After making changes, run relevant tests or linters to verify correctness.",
-    "- Keep prose concise. After finishing, briefly summarize what you did.",
-    "- If a tool call fails, read the error carefully and retry with corrected parameters.",
-    "- For multi-file changes, make them one at a time and verify each step.",
+    "- If a tool call fails, read the error carefully and retry with corrected parameters. If a tool is DENIED by permissions, do not retry it — use another approach or ask the user.",
     "- When a problem could be environmental (missing runtime, wrong version, PATH issue), diagnose with system_info, dev_env_report, and where_is before guessing.",
     "- Never end your reply right after requesting a tool — the tool result always comes back to you; keep working until the task is done, then summarize.",
+    "- Keep prose concise. After finishing, briefly summarize what you did.",
   ].join("\n");
+}
+
+// ── Context-window management ────────────────────────────────────────────
+// Keep the conversation inside the model's context window. When the last
+// request's token usage crosses the threshold, older messages are collapsed
+// into a deterministic digest (original request + tools used) and only a
+// recent tail is kept verbatim.
+
+// Rough token estimate when the provider hasn't reported usage yet (~4 chars/token).
+export function estimateTokens(messages) {
+  let chars = 0;
+  for (const m of messages || []) {
+    chars += (typeof m.content === "string" ? m.content.length : 0) + 20;
+    for (const call of m.tool_calls || []) {
+      chars += (call.function?.arguments?.length || 0) + (call.function?.name?.length || 0) + 30;
+    }
+  }
+  return Math.ceil(chars / 4);
+}
+
+// Collapse everything between the system prompt and the last `keepTail`
+// messages into one digest message. Mutates `messages` in place. Returns
+// true when something was actually compacted.
+export function compactMessages(messages, { keepTail = 8 } = {}) {
+  if (!Array.isArray(messages) || messages.length < keepTail + 4) return false;
+  const hasSystem = messages[0]?.role === "system";
+  const first = hasSystem ? 1 : 0;
+
+  let cut = messages.length - keepTail;
+  // The tail must not open with tool results whose assistant tool_calls
+  // message was dropped — the API rejects orphaned tool messages.
+  while (cut < messages.length && messages[cut].role === "tool") cut++;
+  if (cut - first < 3) return false;
+
+  const dropped = messages.slice(first, cut);
+  const firstUser = dropped.find((m) => m.role === "user" && typeof m.content === "string");
+  const toolTrail = [];
+  for (const m of dropped) {
+    for (const call of m.tool_calls || []) {
+      const fn = call.function || {};
+      let hint = "";
+      try {
+        const args = JSON.parse(fn.arguments || "{}");
+        hint = args.path || args.pattern || args.command || args.query || (Array.isArray(args.paths) ? args.paths.join(", ") : "");
+      } catch { /* args stay opaque */ }
+      toolTrail.push(`${fn.name || "?"}${hint ? ` (${String(hint).slice(0, 80)})` : ""}`);
+    }
+  }
+  const digest = [
+    "[CONTEXT COMPACTED] Earlier conversation was condensed to fit the model's context window. Continue the task from the recent messages below.",
+    firstUser ? `Original request: ${firstUser.content.slice(0, 600)}` : "",
+    toolTrail.length ? `Tools already used (${toolTrail.length}): ${toolTrail.slice(-40).join("; ")}` : "",
+  ].filter(Boolean).join("\n");
+
+  messages.splice(first, cut - first, { role: "user", content: digest });
+  return true;
+}
+
+// Auto-compact when the live conversation nears the context window. The
+// budget leaves room for the response (maxTokens) plus a safety margin.
+function maybeAutoCompact({ model, messages, session }) {
+  const window = model.contextWindow;
+  if (!window) return false;
+  const budget = Math.max(window - (model.maxTokens || 0), Math.floor(window * 0.5));
+  const used = session.contextTokens || estimateTokens(messages);
+  if (used < budget * 0.85) return false;
+  const did = compactMessages(messages);
+  if (did) {
+    session.setContextTokens(estimateTokens(messages));
+    warnLine(`context ${used} tokens near the ${window}-token window — auto-compacted older messages`);
+  }
+  return did;
 }
 
 // Tools the user answered "always allow" for this session (permission "ask").
@@ -176,8 +253,22 @@ export async function runTurn({ model, messages, session, maxIterations = 30, di
   const paramRegistry = buildParamRegistry(tools);
   const MAX_PARSE_RECOVERIES = 3;
   let parseRecoveries = 0;
+  let wrapUpNudged = false;
 
   for (let i = 0; i < maxIterations; i++) {
+    // Keep the conversation inside the model's context window.
+    maybeAutoCompact({ model, messages, session });
+
+    // Near the iteration budget, tell the model to land the work instead of
+    // getting cut off mid-task.
+    if (!wrapUpNudged && maxIterations - i === 3) {
+      wrapUpNudged = true;
+      messages.push({
+        role: "user",
+        content: "[system note] Only 3 tool iterations remain this turn. Finish the smallest complete unit of work, verify if possible, then summarize what is done and what remains.",
+      });
+    }
+
     let resp;
     let streamedContent = false;
     let tokenCount = 0;
@@ -392,6 +483,14 @@ function argSummary(name, args) {
       return args.url || "";
     case "youtube_transcript":
       return args.url || "";
+    case "rag_search":
+      return args.query || "";
+    case "rag_index":
+      return "";
+    case "find_symbol":
+      return (args.references ? "refs " : "") + (args.name || "") + (args.path ? ` in ${args.path}` : "");
+    case "deps":
+      return [args.action || "detect", args.manager].filter(Boolean).join(" ");
     case "memory_save":
       return (args.text || "").slice(0, 60);
     case "memory_search":

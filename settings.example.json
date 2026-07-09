@@ -70,6 +70,9 @@
   },
 
   // Model catalog: <key> -> { provider, id, maxTokens }. Switch with /model <key>.
+  // maxTokens is the OUTPUT cap per response (sent as max_tokens).
+  // The context window is auto-detected (provider metadata, then a known-family
+  // table); pin it explicitly with "contextWindow": 202752 or the /context command.
   "models": {
     "nvidia/glm-5.2":       { "provider": "nvidia",     "id": "z-ai/glm-5.2",                "maxTokens": 16384 },
     "nvidia/llama-3.3-70b": { "provider": "nvidia",     "id": "meta/llama-3.3-70b-instruct", "maxTokens": 4096 },
@@ -81,14 +84,17 @@
 
   // Local llama.cpp server (drives the "local" provider). Point modelsDir at your
   // own folder of .gguf files; manage with /llama list|start|stop|status.
-  // binDir "" defaults to <install>/llama. contextSize 0 = read from GGUF header.
-  // ngl is GPU layers (0 = CPU only). defaultModel loads on a bare /llama start.
+  // binDir "" defaults to <install>/llama. contextSize "auto" (or 0) loads the
+  // model's full trained context from the GGUF header, capped at maxAutoContext
+  // to bound RAM/VRAM. ngl is GPU layers (0 = CPU only). defaultModel loads on
+  // a bare /llama start.
   "llama": {
     "binDir": "",
     "modelsDir": "C:\\models",
     "host": "127.0.0.1",
     "port": 8080,
-    "contextSize": 8192,
+    "contextSize": "auto",
+    "maxAutoContext": 131072,
     "ngl": 99,
     "defaultModel": "",
     "extraArgs": []

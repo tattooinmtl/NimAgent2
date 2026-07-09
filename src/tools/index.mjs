@@ -10,6 +10,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import { rgPath, fdPath, jqPath, INSTALL_ROOT } from "../paths.mjs";
 import { HOME } from "../core/config.mjs";
+import { buildIndex as ragBuild, searchIndex as ragSearch } from "../integrations/rag.mjs";
 
 const MAX_OUTPUT = 30000;
 const PROCESS_LOG_LIMIT = 20000;
@@ -106,6 +107,41 @@ function runShellCommand({ command, timeout_ms = 120000, allow_unsafe = false, d
   if (r.status === null && r.error?.killed) out += "\n[timeout: command exceeded time limit]";
   out += `\n[exit code: ${r.status ?? "null"}]`;
   return clip(out.trim());
+}
+
+// Read-only dependency commands per package manager (used by the deps tool).
+// Installs/updates stay in run_shell where the risk gate applies.
+const DEPS_COMMANDS = {
+  npm:      { list: "npm ls --depth=0", outdated: "npm outdated", audit: "npm audit" },
+  pnpm:     { list: "pnpm ls --depth 0", outdated: "pnpm outdated", audit: "pnpm audit" },
+  yarn:     { list: "yarn list --depth=0", outdated: "yarn outdated", audit: "yarn audit" },
+  bun:      { list: "bun pm ls", outdated: "bun outdated", audit: "bun audit" },
+  pip:      { list: "pip list", outdated: "pip list --outdated", audit: "pip-audit" },
+  cargo:    { list: "cargo tree --depth 1", outdated: "cargo update --dry-run", audit: "cargo audit" },
+  go:       { list: "go list -m all", outdated: "go list -u -m all", audit: "govulncheck ./..." },
+  composer: { list: "composer show --direct", outdated: "composer outdated --direct", audit: "composer audit" },
+  bundler:  { list: "bundle list", outdated: "bundle outdated", audit: "bundle audit check" },
+  dotnet:   { list: "dotnet list package", outdated: "dotnet list package --outdated", audit: "dotnet list package --vulnerable" },
+};
+
+function detectPackageManagers() {
+  const has = (f) => fs.existsSync(path.join(process.cwd(), f));
+  const managers = [];
+  if (has("package.json")) {
+    if (has("pnpm-lock.yaml")) managers.push("pnpm");
+    else if (has("yarn.lock")) managers.push("yarn");
+    else if (has("bun.lockb") || has("bun.lock")) managers.push("bun");
+    else managers.push("npm");
+  }
+  if (has("requirements.txt") || has("pyproject.toml") || has("Pipfile")) managers.push("pip");
+  if (has("Cargo.toml")) managers.push("cargo");
+  if (has("go.mod")) managers.push("go");
+  if (has("composer.json")) managers.push("composer");
+  if (has("Gemfile")) managers.push("bundler");
+  try {
+    if (fs.readdirSync(process.cwd()).some((f) => f.endsWith(".csproj") || f.endsWith(".sln"))) managers.push("dotnet");
+  } catch { /* unreadable cwd — skip */ }
+  return managers;
 }
 
 export const tools = [
@@ -487,6 +523,65 @@ export const tools = [
   {
     type: "function",
     function: {
+      name: "rag_search",
+      description:
+        "Retrieve the most relevant code/doc chunks from the workspace RAG index (BM25 over chunked files, camelCase-aware). Use during EXPLORE to find where something lives when you don't know the exact file. Auto-builds/refreshes the index on first use.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "What to look for — identifiers, phrases, or a short description" },
+          k: { type: "integer", description: "Max chunks to return, default 6" },
+        },
+        required: ["query"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "rag_index",
+      description:
+        "(Re)build the workspace RAG index used by rag_search. Only needed to force a full rebuild — rag_search refreshes stale indexes automatically.",
+      parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "find_symbol",
+      description:
+        "Code navigation: locate where a symbol (function, class, method, variable, type) is DEFINED, using language-aware patterns across JS/TS, Python, Go, Rust, C#, Java, PHP, Ruby and more. Set references=true to list every usage instead. Faster and more precise than plain search for jump-to-definition style questions.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Exact symbol name, e.g. 'resolveModel'" },
+          kind: { type: "string", enum: ["any", "function", "class", "variable"], description: "Narrow the definition patterns; default any" },
+          path: { type: "string", description: "Directory or file to search, default workspace root" },
+          references: { type: "boolean", description: "true = list all usages instead of definitions" },
+        },
+        required: ["name"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "deps",
+      description:
+        "Package-manager integration: auto-detects the project's manager(s) (npm/pnpm/yarn/bun, pip, cargo, go, composer, bundler, dotnet) and runs read-only dependency commands. Actions: detect (which managers apply), list (installed direct deps), outdated (available updates), audit (known vulnerabilities). Use run_shell for installs.",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["detect", "list", "outdated", "audit"], description: "Default detect" },
+          manager: { type: "string", description: "Override auto-detection, e.g. 'pip' in a mixed repo" },
+          timeout_ms: { type: "integer", description: "Command timeout, default 120000" },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "system_info",
       description:
         "Report the user's machine: OS version, CPU, RAM, GPU, disks, hostname, Node version, shell, cwd. Use when diagnosing environment-dependent problems.",
@@ -567,6 +662,79 @@ export const impl = {
 
     stream.destroy(); // ensure file handle is released
     return clip(lines.join("\n") || "(empty file)");
+  },
+
+  rag_search({ query, k = 6 }) {
+    const hits = ragSearch(query, Math.min(Math.max(k, 1), 20));
+    if (!hits.length) return "(no matching chunks — try different keywords, or rag_index to rebuild)";
+    return clip(hits
+      .map((h) => `--- ${h.file}:${h.startLine}-${h.endLine} (score ${h.score.toFixed(2)}) ---\n${h.text}`)
+      .join("\n\n"));
+  },
+
+  rag_index() {
+    const { files, chunks, skipped } = ragBuild();
+    return `Indexed ${files} file(s) into ${chunks} chunk(s)${skipped ? ` (${skipped} skipped: too large or over limits)` : ""}.`;
+  },
+
+  find_symbol({ name, kind = "any", path: p = ".", references = false }) {
+    if (!name || !/^[\w$.]+$/.test(name)) throw new Error("name must be a plain symbol (letters, digits, _, $, .)");
+    const n = name.replace(/[.$]/g, "\\$&");
+
+    // Definition patterns by symbol kind, covering the common languages.
+    // Keyword-led declarations are the reliable core; assignment and method
+    // forms catch JS/TS arrow functions and class bodies.
+    const PATTERNS = {
+      function: [
+        `(?:function|def|fn|func|sub|proc)\\s+(?:\\([^)]*\\)\\s*)?${n}\\b`,
+        `${n}\\s*[:=]\\s*(?:async\\s+)?(?:function\\b|\\()`,
+        `^\\s*(?:public|private|protected|internal|static|final|override|virtual|async|export)[\\w<>\\[\\], ]*\\s${n}\\s*\\(`,
+        `^\\s*(?:async\\s+)?${n}\\s*\\([^)]*\\)\\s*\\{`,
+      ],
+      class: [
+        `(?:class|struct|enum|trait|interface|type|module|impl|protocol|record)\\s+${n}\\b`,
+      ],
+      variable: [
+        `(?:const|let|var|val|static|readonly)\\s+(?:mut\\s+)?${n}\\b`,
+        `^\\s*${n}\\s*[:=][^=]`,
+      ],
+    };
+    const patterns = references
+      ? [`\\b${n}\\b`]
+      : kind === "any"
+        ? [...PATTERNS.function, ...PATTERNS.class, ...PATTERNS.variable]
+        : PATTERNS[kind] || [];
+    if (!patterns.length) throw new Error(`kind must be any, function, class, or variable`);
+
+    const args = ["--line-number", "--no-heading", "--color", "never"];
+    for (const pat of patterns) args.push("-e", pat);
+    if (references) args.push("--max-count", "50");
+    args.push(resolve(p));
+    const r = spawnSync(rgPath(), args, { encoding: "utf8", maxBuffer: 1024 * 1024 * 16 });
+    if (r.error) return "find_symbol unavailable: " + r.error.message;
+    if (r.status === 1 || !r.stdout) {
+      return references
+        ? `(no references to "${name}" found)`
+        : `(no definition of "${name}" found — try references=true or a broader path)`;
+    }
+    const label = references ? `References to "${name}"` : `Definitions of "${name}"`;
+    return clip(`${label}:\n${r.stdout.trim()}`);
+  },
+
+  deps({ action = "detect", manager, timeout_ms = 120000 }) {
+    const detected = detectPackageManagers();
+    if (action === "detect") {
+      return detected.length
+        ? `Detected package manager(s): ${detected.join(", ")}\nAvailable actions: list, outdated, audit.`
+        : "(no package-manager manifests found in this workspace)";
+    }
+    const mgr = String(manager || detected[0] || "").toLowerCase();
+    if (!mgr) return "(no package manager detected — nothing to run)";
+    const commands = DEPS_COMMANDS[mgr];
+    if (!commands) throw new Error(`unsupported manager "${mgr}" (known: ${Object.keys(DEPS_COMMANDS).join(", ")})`);
+    const command = commands[action];
+    if (!command) throw new Error("action must be detect, list, outdated, or audit");
+    return `$ ${command}\n` + runShellCommand({ command, timeout_ms });
   },
 
   async read_many_files({ paths = [], limit_per_file = 400 }) {

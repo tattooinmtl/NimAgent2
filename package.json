@@ -15,7 +15,7 @@
     "url": "https://github.com/tattooinmtl/NimAgent2/issues"
   },
   "bin": {
-    "NimAgent": "./bin/nimagent.mjs"
+    "nim2": "./bin/nimagent.mjs"
   },
   "engines": {
     "node": ">=20.0.0"

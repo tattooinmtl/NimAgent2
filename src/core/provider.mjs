@@ -3,7 +3,7 @@
 //
 // Sends stream:true, parses the SSE response, calls onToken for each text delta,
 // and returns { message, finishReason, usage } once the stream ends.
-function authHeaders(provider) {
+export function authHeaders(provider) {
   const headers = { "Content-Type": "application/json" };
   const key = String(provider.apiKey || "").trim();
   if (key && key !== "not-needed") headers.Authorization = `Bearer ${key}`;

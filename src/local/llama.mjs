@@ -27,7 +27,7 @@ export function llamaConfig(settings) {
     port: cfg.port || 8080,
     // contextSize 0 or "auto" => read the model's trained context from the GGUF.
     contextSize: cfg.contextSize ?? 0,
-    maxAutoContext: cfg.maxAutoContext || 16384, // cap auto context to bound RAM/VRAM
+    maxAutoContext: cfg.maxAutoContext || 131072, // cap auto context to bound RAM/VRAM
     ngl: cfg.ngl ?? 99,
     defaultModel: cfg.defaultModel || "",
     extraArgs: Array.isArray(cfg.extraArgs) ? cfg.extraArgs : [],

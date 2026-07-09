@@ -37,7 +37,7 @@ console.log("\nTest 1: jq_query");
 
 await assert("reads top-level string field",
   await runTool("jq_query", { filter: ".name", path: "package.json", raw: true }),
-  r => r.trim() === "nimagent"
+  r => r.trim() === "nimagent2"
 );
 
 await assert("extracts object keys",
@@ -259,6 +259,49 @@ await assert("NVIDIA request body never sends native tool payloads",
     tools: [{ type: "function", function: { name: "read_file", parameters: { type: "object", properties: {} } } }],
   }),
   r => !("tools" in r) && !("tool_choice" in r) && !r.messages.some(m => m.role === "tool" || m.tool_calls)
+);
+
+// ── Test 8: code navigation + package manager tools ───────────────
+console.log("\nTest 8: find_symbol + deps");
+
+await assert("find_symbol locates a function definition",
+  await runTool("find_symbol", { name: "resolveModel", path: "src" }),
+  r => r.includes("Definitions of") && r.includes("core/config.mjs".replace("/", path.sep)) || r.includes("config.mjs")
+);
+
+await assert("find_symbol respects kind=class",
+  await runTool("find_symbol", { name: "Session", kind: "class", path: "src" }),
+  r => r.includes("config.mjs") && r.includes("class Session")
+);
+
+await assert("find_symbol references mode lists usages",
+  await runTool("find_symbol", { name: "systemPrompt", path: "src", references: true }),
+  r => r.includes("References to") && r.split("\n").length > 2
+);
+
+await assert("find_symbol rejects regex injection",
+  await resultOf(() => runTool("find_symbol", { name: "foo|bar(" })),
+  r => String(r).startsWith("ERROR:")
+);
+
+await assert("find_symbol reports missing symbols cleanly",
+  await runTool("find_symbol", { name: "definitelyNotASymbolXyz", path: "src" }),
+  r => r.includes("no definition")
+);
+
+await assert("deps detects npm from package.json",
+  await runTool("deps", { action: "detect" }),
+  r => r.includes("npm")
+);
+
+await assert("deps list runs the manager command",
+  await runTool("deps", { action: "list", timeout_ms: 60000 }),
+  r => r.startsWith("$ npm ls") && r.includes("nimagent2")
+);
+
+await assert("deps rejects unknown manager",
+  await resultOf(() => runTool("deps", { action: "list", manager: "nonsense" })),
+  r => String(r).startsWith("ERROR:") && String(r).includes("unsupported manager")
 );
 
 // ── Summary ───────────────────────────────────────────────────────

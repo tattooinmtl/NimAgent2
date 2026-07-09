@@ -12,6 +12,9 @@ import {
   saveSettings, resolveModel, SETTINGS_PATH, HOME, Session,
 } from "../core/config.mjs";
 import { runTool, tools } from "../tools/index.mjs";
+import { compactMessages, estimateTokens } from "../core/agent.mjs";
+import { detectContextWindow, parseContextSize, formatContextSize } from "../core/context.mjs";
+import { buildIndex, searchIndex, indexStatus, clearIndex } from "../integrations/rag.mjs";
 import { INSTALL_ROOT } from "../integrations/extras.mjs";
 import { installPackage, uninstallPackage, listInstalled, DEFAULT_REGISTRY } from "../integrations/registry.mjs";
 import { mcpStatus, reconnectServer } from "../integrations/mcp.mjs";
@@ -46,6 +49,7 @@ export const COMMANDS = [
     summary: "session overview: model, effort, persona, goal, memory, tokens",
     handler: async (ctx) => {
       infoLine(`model:    ${ctx.model.key} (${ctx.model.providerLabel})`);
+      infoLine(`context:  ${(ctx.session.contextTokens || 0).toLocaleString()} / ${ctx.model.contextWindow.toLocaleString()} tokens (${formatContextSize(ctx.model.contextWindow)} window, source: ${ctx.model.contextWindowSource})`);
       infoLine(`effort:   ${ctx.settings.reasoning || "medium"}`);
       infoLine(`persona:  ${ctx.activePersona?.id || "(default)"}${ctx.routePinned ? " [pinned]" : ""}`);
       infoLine(`goal:     ${goalStatusLine(ctx)}`);
@@ -67,20 +71,17 @@ export const COMMANDS = [
   },
   {
     name: "compact", aliases: [], usage: "/compact [now]", category: "Session",
-    summary: "compact the conversation to save tokens (now = force)",
+    summary: "compact the conversation to save context (now = aggressive)",
     handler: (ctx, arg) => {
       const force = arg.trim().toLowerCase() === "now";
-      if (!force && ctx.messages.length <= 3) {
-        infoLine("conversation too short to compact — use /compact now to force");
+      const before = ctx.messages.length;
+      const did = compactMessages(ctx.messages, { keepTail: force ? 2 : 8 });
+      if (!did) {
+        infoLine("conversation too short to compact" + (force ? "" : " — use /compact now for an aggressive pass"));
         return;
       }
-      const sys = ctx.messages[0];
-      const trail = force ? [] : ctx.messages.slice(-2);
-      ctx.messages.length = 0;
-      ctx.messages.push(sys);
-      ctx.messages.push({ role: "system", content: "[Earlier conversation was compacted. Continue from here.]" });
-      ctx.messages.push(...trail);
-      infoLine(`compacted conversation (${ctx.messages.length} message(s) remaining)`);
+      ctx.session.setContextTokens(estimateTokens(ctx.messages));
+      infoLine(`compacted conversation: ${before} → ${ctx.messages.length} message(s)`);
     },
   },
   {
@@ -184,6 +185,42 @@ export const COMMANDS = [
     },
   },
   {
+    name: "rag", aliases: [], usage: "/rag [index|search <q>|status|clear]", category: "Agent",
+    summary: "workspace retrieval index (RAG): build, search, status, clear",
+    handler: async (ctx, arg) => {
+      const [sub, ...rest] = arg.trim().split(/\s+/).filter(Boolean);
+      const query = rest.join(" ");
+      try {
+        if (!sub || sub === "status") {
+          const st = indexStatus();
+          if (!st.exists) {
+            infoLine("no RAG index for this directory yet — build with /rag index (rag_search also auto-builds)");
+            return;
+          }
+          infoLine(`index: ${st.files} file(s), ${st.chunks} chunk(s), built ${st.builtAt}` +
+            (st.stale ? ` — ${st.stale} file(s) changed (auto-refreshes on next search)` : ""));
+          infoLine(`path:  ${st.path}`);
+        } else if (sub === "index" || sub === "build" || sub === "rebuild") {
+          infoLine("indexing workspace …");
+          const r = buildIndex();
+          infoLine(`indexed ${r.files} file(s) into ${r.chunks} chunk(s)${r.skipped ? ` (${r.skipped} skipped)` : ""}`);
+        } else if (sub === "search") {
+          if (!query) { errorLine("usage: /rag search <query>"); return; }
+          const hits = searchIndex(query, 6);
+          if (!hits.length) { infoLine("no matches"); return; }
+          for (const h of hits) {
+            console.log(`    ${c.cyan(h.file)}:${h.startLine}-${h.endLine} ${c.dim(`score ${h.score.toFixed(2)}`)}`);
+            console.log(c.dim("      " + h.text.split("\n").slice(0, 3).join("\n      ").slice(0, 300)));
+          }
+        } else if (sub === "clear") {
+          infoLine(clearIndex() ? "RAG index deleted" : "no index to delete");
+        } else {
+          errorLine("usage: /rag [index|search <query>|status|clear]");
+        }
+      } catch (e) { errorLine(e.message); }
+    },
+  },
+  {
     name: "tools", aliases: [], usage: "/tools", category: "Agent",
     summary: "list every tool the agent can call",
     handler: () => {
@@ -248,6 +285,37 @@ export const COMMANDS = [
         }
         infoLine(`fetch live models with /models <provider>; current provider: ${ctx.model.providerName}`);
       }
+    },
+  },
+  {
+    name: "context", aliases: ["ctx"], usage: "/context [<size>|auto]", category: "Models & Providers",
+    summary: "show or set the active model's context window (e.g. /context 200k)",
+    handler: async (ctx, arg) => {
+      const a = arg.trim().toLowerCase();
+      const entry = ctx.settings.models[ctx.model.key];
+      if (!a) {
+        infoLine(`context window: ${ctx.model.contextWindow.toLocaleString()} tokens (${formatContextSize(ctx.model.contextWindow)}) — source: ${ctx.model.contextWindowSource}`);
+        infoLine(`output cap:     ${ctx.model.maxTokens.toLocaleString()} tokens (max_tokens per response)`);
+        infoLine(`conversation:   ~${(ctx.session.contextTokens || 0).toLocaleString()} tokens in use`);
+        infoLine("set a size with /context 200k (or 131072, 1m); /context auto re-detects from the provider");
+        return;
+      }
+      if (a === "auto" || a === "detect") {
+        if (entry) { delete entry.contextWindow; delete entry.contextWindowDetected; }
+        ctx.model = resolveModel(ctx.settings, ctx.model.key);
+        infoLine(`detecting context window for ${ctx.model.id} …`);
+        await detectContextWindow(ctx);
+        await saveSettings(ctx.settings);
+        infoLine(`context window: ${formatContextSize(ctx.model.contextWindow)} (${ctx.model.contextWindow.toLocaleString()} tokens, source: ${ctx.model.contextWindowSource})`);
+        return;
+      }
+      const n = parseContextSize(a);
+      if (!n) { errorLine("usage: /context [<size>|auto] — size like 131072, 200k, or 1m (min 1024)"); return; }
+      if (!entry) { errorLine(`model ${ctx.model.key} is not in settings — add it with /addmodel first`); return; }
+      entry.contextWindow = n;
+      await saveSettings(ctx.settings);
+      ctx.model = resolveModel(ctx.settings, ctx.model.key);
+      infoLine(`context window for ${ctx.model.key} set to ${n.toLocaleString()} tokens (saved)`);
     },
   },
   {
@@ -511,6 +579,21 @@ export function findCommand(name) {
 
 export function commandNames() {
   return COMMANDS.flatMap((cmd) => [cmd.name, ...cmd.aliases.filter(Boolean)]).map((n) => "/" + n);
+}
+
+// Rows for the live "/" suggestion menu in the REPL: every command whose name
+// (or an alias) starts with `prefix`, deduped, in registry order. An empty
+// prefix returns the full list.
+export function commandMenu(prefix = "") {
+  const p = String(prefix || "").toLowerCase();
+  const rows = [];
+  for (const cmd of COMMANDS) {
+    if (!cmd.name) continue;
+    const names = [cmd.name, ...cmd.aliases.filter(Boolean)];
+    if (!names.some((n) => n.startsWith(p))) continue;
+    rows.push({ name: cmd.name, usage: cmd.usage, summary: cmd.summary, category: cmd.category });
+  }
+  return rows;
 }
 
 function levenshtein(a, b) {

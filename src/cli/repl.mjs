@@ -12,9 +12,10 @@ import { disconnectAll } from "../integrations/mcp.mjs";
 import { disconnectBridge } from "../integrations/bridge.mjs";
 import { classifyIntent, killSidecar } from "../integrations/router.mjs";
 import * as llama from "../local/llama.mjs";
+import { detectContextWindow } from "../core/context.mjs";
 import { applySkill, restoreSessionMessages, reportMissingKey } from "./helpers.mjs";
 import { activeModelBlockedByHealth } from "./models.mjs";
-import { dispatchCommand, commandNames } from "./commands.mjs";
+import { dispatchCommand, commandNames, commandMenu } from "./commands.mjs";
 import { nextGoalStep } from "./goal.mjs";
 
 export async function startRepl(ctx, { resumeMode = false } = {}) {
@@ -29,6 +30,10 @@ export async function startRepl(ctx, { resumeMode = false } = {}) {
 
   // First-run onboarding: guide the user to configure a key if none is set.
   if (reportMissingKey(ctx.model)) console.log("");
+
+  // Refresh the model's context window from provider metadata in the
+  // background; the sync ladder value (user/table) is already in place.
+  detectContextWindow(ctx).catch(() => {});
 
   // --resume: rebuild the conversation from the last session before prompting.
   if (resumeMode) {
@@ -101,10 +106,80 @@ export async function startRepl(ctx, { resumeMode = false } = {}) {
     }
   }
 
+  // ── Live "/" command menu ────────────────────────────────────────────────
+  // While the input line starts with "/", a filtered command list renders
+  // below the prompt and narrows as the user types (e.g. "/m" shows every
+  // command starting with m). Cleared on submit or when the "/" is deleted.
+  const MENU_MAX = 12;
+  let menuLines = 0;      // rows the menu currently occupies below the input
+  let promptActive = false;
+
+  function buildMenuRows(line) {
+    const body = line.slice(1);
+    if (/\s/.test(body)) return []; // arguments started — hide the menu
+    const prefix = body.toLowerCase();
+    const cmds = commandMenu(prefix).map((r) => ({ usage: r.usage, summary: r.summary }));
+    const skills = ctx.skills
+      .filter((s) => s.command.slice(1).toLowerCase().startsWith(prefix))
+      .map((s) => ({ usage: s.command, summary: s.description || "skill" }));
+    return [...cmds, ...skills];
+  }
+
+  function renderMenu() {
+    if (!process.stdout.isTTY || !promptActive || ctx.currentAbort) return;
+    const line = rl.line || "";
+    const rows = line.startsWith("/") ? buildMenuRows(line) : [];
+    if (!rows.length && !menuLines) return;
+
+    const width = process.stdout.columns || 80;
+    const usageCol = Math.min(34, Math.max(16, width - 30));
+    const shown = rows.slice(0, MENU_MAX);
+    const lines = shown.map((r) => {
+      const usage = r.usage.length > usageCol ? r.usage.slice(0, usageCol - 1) + "…" : r.usage.padEnd(usageCol);
+      const summary = String(r.summary || "").slice(0, Math.max(0, width - usageCol - 4));
+      return "  " + c.cyan(usage) + " " + c.dim(summary);
+    });
+    if (rows.length > MENU_MAX) lines.push(c.dim(`  … ${rows.length - MENU_MAX} more — keep typing to filter`));
+
+    let cols = 2 + (rl.cursor ?? line.length); // fallback: "› " + cursor offset
+    try { cols = rl.getCursorPos().cols; } catch { /* older readline */ }
+
+    const out = ["\x1b[?25l"];
+    // Erase the previous menu without touching the input row: hop one row
+    // down (safe — the old menu occupies rows below), clear to screen end,
+    // hop back up.
+    if (menuLines > 0) out.push("\x1b[1B\r\x1b[0J\x1b[1A");
+    if (lines.length) {
+      out.push("\n" + lines.join("\n"));   // draw below the input line
+      out.push(`\x1b[${lines.length}A`);   // and return to the input row
+    }
+    out.push("\r");
+    if (cols > 0) out.push(`\x1b[${cols}C`);
+    out.push("\x1b[?25h");
+    process.stdout.write(out.join(""));
+    menuLines = lines.length;
+  }
+
+  function clearMenuAfterSubmit() {
+    // Called from the line handler: readline has already echoed the newline,
+    // so the cursor sits on the menu's first row — erase down from here.
+    if (menuLines > 0 && process.stdout.isTTY) {
+      process.stdout.write("\r\x1b[0J");
+      menuLines = 0;
+    }
+  }
+
+  process.stdin.on("keypress", (_str, key) => {
+    if (!promptActive || ctx.currentAbort) return;
+    if (key && (key.name === "return" || key.name === "enter")) return;
+    setImmediate(renderMenu);
+  });
+
   function showPrompt() {
     clearPendingInput();
     statusBar(ctx.model, ctx.session);
     promptTop();
+    promptActive = true;
     rl.prompt();
   }
 
@@ -152,6 +227,8 @@ export async function startRepl(ctx, { resumeMode = false } = {}) {
   let multiLine = "";
 
   rl.on("line", async (input) => {
+    promptActive = false;
+    clearMenuAfterSubmit();
     const line = input.trim();
 
     // Multi-line continuation

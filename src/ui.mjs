@@ -39,12 +39,12 @@ const LOGO_AGENT = [
 ];
 const LOGO_SEP_V2 = ["   ", "   ", "   ", "   ", "   ", "   "];
 const LOGO_V2 = [
-  "██╗   ██╗██████╗ ",
-  "██║   ██║╚════██╗",
-  "██║   ██║ █████╔╝",
-  "╚██╗ ██╔╝██╔═══╝ ",
-  " ╚████╔╝ ███████╗",
-  "  ╚═══╝  ╚══════╝",
+  "██╗   ██╗██████╗     ██╗",
+  "██║   ██║╚════██╗   ███║",
+  "██║   ██║ █████╔╝   ╚██║",
+  "╚██╗ ██╔╝██╔═══╝     ██║",
+  " ╚████╔╝ ███████╗██╗ ██║",
+  "  ╚═══╝  ╚══════╝╚═╝ ╚═╝",
 ];
 const LOGO_SUBTITLE = "vice summer edition 2026";
 
@@ -204,8 +204,10 @@ export function statusBar(model, session) {
   const fmtK = (n) =>
     n >= 1000 ? (n / 1000).toFixed(n % 1000 === 0 ? 0 : 1) + "k" : String(n);
 
-  const used = (session && session.totalTokens) || 0;
-  const cap = (model && model.maxTokens) || 0;
+  // Context usage: size of the live conversation (last request's prompt +
+  // completion) against the model's context WINDOW — not the output cap.
+  const used = (session && (session.contextTokens || 0)) || 0;
+  const cap = (model && (model.contextWindow || model.maxTokens)) || 0;
   const pct = cap ? Math.min(100, Math.round((used / cap) * 100)) : 0;
 
   // Persona tag: "[coding]" or "[assistant]" when router is active.
@@ -213,7 +215,7 @@ export function statusBar(model, session) {
     ? c.yellow(`[${_activePersona.label}] `)
     : "";
 
-  const left = `${fmtK(used)}/${fmtK(cap)} (${pct}%)`;
+  const left = `ctx ${fmtK(used)}/${fmtK(cap)} (${pct}%)`;
   const provider = model?.providerLabel || model?.providerName || "?";
   let id = model?.id || model?.key || "?";
   let right = `(${provider}) ${id}`;

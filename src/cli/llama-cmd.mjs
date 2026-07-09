@@ -95,7 +95,7 @@ export async function llamaCommand(ctx, sub, subArg) {
           const info = await llama.startServer(ctx.settings, target, { onLog: (m) => warnLine(m) });
           ctx.settings.providers.local.baseUrl = info.url;
           ctx.settings.models["local/coder"].id = info.model;
-          ctx.settings.models["local/coder"].maxTokens = info.contextSize || ctx.settings.models["local/coder"].maxTokens;
+          ctx.settings.models["local/coder"].contextWindowDetected = info.contextSize || undefined;
           await saveSettings(ctx.settings);
           ctx.model = resolveModel(ctx.settings, "local/coder");
           infoLine(`local model ready and selected — ${info.model} @ ${info.url}`);
@@ -133,7 +133,8 @@ export async function llamaCommand(ctx, sub, subArg) {
           ...(ctx.settings.models["local/coder"] || {}),
           provider: "local",
           id: info.model,
-          maxTokens: info.contextSize || ctx.settings.models["local/coder"]?.maxTokens || 8192,
+          maxTokens: ctx.settings.models["local/coder"]?.maxTokens || 8192,
+          contextWindowDetected: info.contextSize || undefined,
         };
         await saveSettings(ctx.settings);
         ctx.model = resolveModel(ctx.settings, "local/coder");
