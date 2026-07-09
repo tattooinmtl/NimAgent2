@@ -1,8 +1,9 @@
-# NimAgent V2
+# NimAgent V2.1
 
 *Vice Summer Edition 2026*
 
-A from-scratch terminal coding agent for Windows. Talks to **OpenAI-compatible**
+A from-scratch terminal coding agent for Windows — now with expanded capabilities for semantic
+code navigation, test coverage analysis, and security scanning. Talks to **OpenAI-compatible**
 providers (NVIDIA NIM, local llama.cpp, Ollama, OpenRouter, …), runs a
 tool-calling agent loop with per-tool permissions, persistent memory, and goal
 mode — all with **zero npm dependencies** (pure Node ≥ 20 + built-in `fetch`).
@@ -24,7 +25,7 @@ mode — all with **zero npm dependencies** (pure Node ≥ 20 + built-in `fetch`
 git clone https://github.com/tattooinmtl/NimAgent2.git
 cd NimAgent2
 .\install\install.ps1
-npm start
+nim2
 ```
 
 NimAgent ships **with no API keys** — supply your own. First run writes a clean
@@ -44,7 +45,7 @@ with empty placeholders. `agent/`, `.env`, and `vendor/` are git-ignored.
 ## Usage
 
 ```powershell
-npm start                              # interactive REPL
+nim2                                   # interactive REPL
 node bin\nimagent.mjs "fix the bug"    # one-shot mode
 node bin\nimagent.mjs --model local/coder --resume
 node bin\nimagent.mjs install <pkg>    # package manager (install|uninstall|list|search)
