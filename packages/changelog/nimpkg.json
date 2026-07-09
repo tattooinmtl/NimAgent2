@@ -1,0 +1,7 @@
+{
+  "name": "changelog",
+  "version": "1.0.0",
+  "type": "skill",
+  "command": "/changelog",
+  "description": "Generate or update CHANGELOG.md from recent git history."
+}

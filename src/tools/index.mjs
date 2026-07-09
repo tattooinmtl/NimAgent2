@@ -1,0 +1,1524 @@
+// Tool definitions (OpenAI function-calling schema) + implementations.
+// File ops, shell, and code search — the core of a coding agent.
+
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { createReadStream } from "node:fs";
+import { createInterface } from "node:readline";
+import { spawn, spawnSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
+import { rgPath, fdPath, jqPath, INSTALL_ROOT } from "../paths.mjs";
+import { HOME } from "../core/config.mjs";
+
+const MAX_OUTPUT = 30000;
+const PROCESS_LOG_LIMIT = 20000;
+const managedProcesses = new Map();
+let nextProcessId = 1;
+
+function clip(s) {
+  s = String(s);
+  return s.length > MAX_OUTPUT ? s.slice(0, MAX_OUTPUT) + "\n…[truncated]" : s;
+}
+
+function workspaceRoot() {
+  return path.resolve(process.cwd());
+}
+
+function assertInsideWorkspace(full, label = "path") {
+  const root = workspaceRoot();
+  const rel = path.relative(root, full);
+  if (rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel))) return full;
+  throw new Error(`${label} escapes workspace: ${path.relative(root, full) || full}`);
+}
+
+function resolve(p = ".") {
+  return assertInsideWorkspace(path.resolve(process.cwd(), p));
+}
+
+function resolveForCreate(p) {
+  return assertInsideWorkspace(path.resolve(process.cwd(), p));
+}
+
+function commandRisk(command) {
+  const c = String(command || "").toLowerCase();
+  const destructive = [
+    /\brm\s+(-[^\n]*r|--recursive)/,
+    /\bremove-item\b[^\n]*(\s-r|\s-recurse|recursive)/,
+    /\brmdir\b[^\n]*(\/s|-r|--recursive)/,
+    /\bdel\b[^\n]*(\/s|\/q)/,
+    /\bgit\s+(reset\s+--hard|clean\s+-[^\n]*[xfd])/,
+    /\bformat\b\s+[a-z]:/,
+    /\bshutdown\b/,
+    /\breg\s+delete\b/,
+    /\bset-executionpolicy\b/,
+  ].some((re) => re.test(c));
+  if (destructive) {
+    return {
+      level: "blocked",
+      reason: "destructive or irreversible command",
+    };
+  }
+  const elevated = [
+    /\bnpm\s+(install|i)\b/,
+    /\bpnpm\s+(install|add)\b/,
+    /\byarn\s+(install|add)\b/,
+    /\bpip\s+install\b/,
+    /\bdocker\s+(run|compose|build|pull|push)\b/,
+    /\bgh\s+pr\s+(merge|close)\b/,
+  ].some((re) => re.test(c));
+  if (elevated) return { level: "caution", reason: "may change dependencies, external services, or network state" };
+  return { level: "normal", reason: "no high-risk pattern detected" };
+}
+
+// Helper to run a shell command (used by run_shell and run_test)
+function runShellCommand({ command, timeout_ms = 120000, allow_unsafe = false, dry_run = false }) {
+  const risk = commandRisk(command);
+  if (dry_run) {
+    return [
+      `DRY RUN: ${command}`,
+      `risk: ${risk.level}`,
+      `reason: ${risk.reason}`,
+      `cwd: ${process.cwd()}`,
+    ].join("\n");
+  }
+  if (!allow_unsafe && risk.level === "blocked") {
+    return [
+      "BLOCKED: command looks destructive or irreversible.",
+      "Use safer dedicated tools when possible, or set allow_unsafe=true only when the user explicitly authorized this exact action.",
+      `Risk reason: ${risk.reason}`,
+      `Command: ${command}`,
+    ].join("\n");
+  }
+  const isWin = process.platform === "win32";
+  const shell = isWin ? "powershell.exe" : "/bin/sh";
+  const args = isWin ? ["-NoProfile", "-NonInteractive", "-Command", command] : ["-c", command];
+  const r = spawnSync(shell, args, {
+    encoding: "utf8",
+    timeout: timeout_ms,
+    maxBuffer: 1024 * 1024 * 16,
+    cwd: process.cwd(),
+  });
+  let out = "";
+  if (r.stdout) out += r.stdout;
+  if (r.stderr) out += (out ? "\n" : "") + r.stderr;
+  if (r.error) out += `\n[spawn error: ${r.error.message}]`;
+  if (r.status === null && r.error?.killed) out += "\n[timeout: command exceeded time limit]";
+  out += `\n[exit code: ${r.status ?? "null"}]`;
+  return clip(out.trim());
+}
+
+export const tools = [
+  {
+    type: "function",
+    function: {
+      name: "read_file",
+      description: "Read a text file. Returns up to ~2000 lines with line numbers.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "File path (relative to cwd or absolute)" },
+          offset: { type: "integer", description: "1-based start line (optional)" },
+          limit: { type: "integer", description: "Max lines to read (optional, default 2000)" },
+        },
+        required: ["path"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "read_many_files",
+      description: "Read several text files at once. Use this to gather project context efficiently before editing.",
+      parameters: {
+        type: "object",
+        properties: {
+          paths: { type: "array", items: { type: "string" }, description: "Workspace-relative file paths" },
+          limit_per_file: { type: "integer", description: "Max lines per file, default 400" },
+        },
+        required: ["paths"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "write_file",
+      description: "Create or overwrite a file with the given content.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string" },
+          content: { type: "string" },
+        },
+        required: ["path", "content"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "edit_file",
+      description: "Replace an exact substring in a file. old_string must appear exactly once.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string" },
+          old_string: { type: "string" },
+          new_string: { type: "string" },
+        },
+        required: ["path", "old_string", "new_string"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "apply_patch",
+      description:
+        "Apply a multi-file patch using Begin/End Patch syntax. Supports Add File, Update File, and Delete File. Prefer this for multi-hunk edits.",
+      parameters: {
+        type: "object",
+        properties: {
+          patch: {
+            type: "string",
+            description:
+              "Patch text beginning with *** Begin Patch and ending with *** End Patch. Update hunks use lines prefixed with space, -, or +.",
+          },
+        },
+        required: ["patch"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "list_dir",
+      description: "List files and folders in a directory.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Directory (default cwd)" },
+          recursive: { type: "boolean", description: "List recursively (optional, default false)" },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "search",
+      description: "Search file contents with a regex (ripgrep). Returns matching lines with paths.",
+      parameters: {
+        type: "object",
+        properties: {
+          pattern: { type: "string", description: "Regex pattern" },
+          path: { type: "string", description: "Directory or file to search (default cwd)" },
+          glob: { type: "string", description: "Optional glob filter, e.g. *.ts" },
+          case_insensitive: { type: "boolean", description: "Case-insensitive search (default false)" },
+          context: { type: "integer", description: "Number of context lines before/after each match (default 0)" },
+        },
+        required: ["pattern"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "find_files",
+      description: "Find files/directories quickly using fd. Pattern supports regex (default) or glob-like wildcards.",
+      parameters: {
+        type: "object",
+        properties: {
+          pattern: { type: "string", description: "Regex pattern, or glob-style pattern with * ? []" },
+          path: { type: "string", description: "Directory to search (default cwd)" },
+          type: { type: "string", description: "Optional entry type: f|d|symlink" },
+          max_depth: { type: "integer", description: "Optional max depth" },
+          extension: { type: "string", description: "Filter by file extension (without dot), e.g. 'ts' or 'js'" },
+          respect_gitignore: { type: "boolean", description: "Honor .gitignore rules (default false)" },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "jq_query",
+      description: "Query or transform JSON data using jq. Runs a jq filter on a JSON file and returns the result.",
+      parameters: {
+        type: "object",
+        properties: {
+          filter: { type: "string", description: "jq filter expression, e.g. '.dependencies', '.[] | select(.name == \"foo\")'" },
+          path: { type: "string", description: "Path to JSON file (relative to cwd or absolute)" },
+          raw: { type: "boolean", description: "Output raw strings (no quotes) for scalar results (default false)" },
+        },
+        required: ["filter", "path"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "project_inspect",
+      description:
+        "Inspect the workspace and summarize likely stack, package scripts, dependency managers, test/build commands, and important config files.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Directory to inspect, default cwd" },
+          max_depth: { type: "integer", description: "Directory scan depth, default 2" },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "git_status",
+      description: "Show concise git branch and working tree status for the current workspace.",
+      parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "git_diff",
+      description: "Show a git diff for the workspace, optionally staged or limited to one path.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Optional workspace path to diff" },
+          staged: { type: "boolean", description: "Show staged diff instead of unstaged diff" },
+          stat: { type: "boolean", description: "Show --stat summary instead of full patch" },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "git_commit",
+      description:
+        "Stage selected workspace paths and create a git commit. Use only after reviewing git_status/git_diff and when the user asked to commit.",
+      parameters: {
+        type: "object",
+        properties: {
+          message: { type: "string", description: "Commit message" },
+          paths: { type: "array", items: { type: "string" }, description: "Paths to stage. Omit when all=true." },
+          all: { type: "boolean", description: "Stage all tracked/untracked changes in the workspace" },
+        },
+        required: ["message"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "project_todo",
+      description:
+        "Maintain a persistent project todo list in .nimagent/todos.json. Use it to plan, track, and close multi-step implementation work.",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", description: "list | add | update | done | remove | clear" },
+          id: { type: "string", description: "Todo id for update/done/remove" },
+          title: { type: "string", description: "Todo title for add/update" },
+          status: { type: "string", description: "pending | in_progress | done" },
+          notes: { type: "string", description: "Optional detail or result notes" },
+        },
+        required: ["action"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "run_shell",
+      description:
+        "Run a shell command (PowerShell on Windows) in the cwd and return stdout/stderr. Use for build, test, git, etc.",
+      parameters: {
+        type: "object",
+        properties: {
+          command: { type: "string" },
+          timeout_ms: { type: "integer", description: "Optional timeout, default 120000" },
+          allow_unsafe: {
+            type: "boolean",
+            description: "Set true only when the user explicitly authorized a destructive or irreversible command.",
+          },
+          dry_run: {
+            type: "boolean",
+            description: "Return command risk/cwd details without executing.",
+          },
+        },
+        required: ["command"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "run_test",
+      description: "Run a test command (e.g., npm test, vitest, jest) in the cwd and return output.",
+      parameters: {
+        type: "object",
+        properties: {
+          command: { type: "string", description: "Test command to run (default: npm test)" },
+          timeout_ms: { type: "integer", description: "Optional timeout, default 120000" },
+          allow_unsafe: {
+            type: "boolean",
+            description: "Set true only when the user explicitly authorized a destructive or irreversible command.",
+          },
+          dry_run: {
+            type: "boolean",
+            description: "Return command risk/cwd details without executing.",
+          },
+        },
+        required: ["command"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "start_process",
+      description:
+        "Start a long-running background process such as a dev server. Use process_status to read logs and stop_process to stop it.",
+      parameters: {
+        type: "object",
+        properties: {
+          command: { type: "string", description: "Command to run in the system shell" },
+          cwd: { type: "string", description: "Optional workspace-relative cwd" },
+          name: { type: "string", description: "Optional friendly process name" },
+          allow_unsafe: {
+            type: "boolean",
+            description: "Set true only when the user explicitly authorized a destructive or irreversible command.",
+          },
+        },
+        required: ["command"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "process_status",
+      description: "List managed background processes or show one process with recent logs.",
+      parameters: {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "Optional process id" },
+          logs: { type: "boolean", description: "Include recent stdout/stderr logs, default true for a single process" },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "stop_process",
+      description: "Stop a managed background process started by start_process.",
+      parameters: {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "Process id returned by start_process" },
+        },
+        required: ["id"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "memory_save",
+      description:
+        "Save a durable fact to persistent memory (survives across sessions and projects). Use for user preferences, project goals, decisions, and lessons learned — not for things already in the code or this conversation.",
+      parameters: {
+        type: "object",
+        properties: {
+          text: { type: "string", description: "The fact to remember, written so it makes sense out of context" },
+          tags: { type: "array", items: { type: "string" }, description: "Optional topic tags, e.g. ['preferences','nimagent']" },
+        },
+        required: ["text"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "memory_search",
+      description: "Search persistent memory by keywords. Returns the best-matching saved facts with their ids.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Keywords to search for" },
+          limit: { type: "integer", description: "Max results, default 8" },
+        },
+        required: ["query"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "memory_list",
+      description: "List the most recent persistent memories.",
+      parameters: {
+        type: "object",
+        properties: {
+          limit: { type: "integer", description: "Max entries, default 20" },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "memory_forget",
+      description: "Delete a persistent memory by its id (use when a saved fact is wrong or obsolete).",
+      parameters: {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "Memory id, e.g. 'm1a2b3c4'" },
+        },
+        required: ["id"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "system_info",
+      description:
+        "Report the user's machine: OS version, CPU, RAM, GPU, disks, hostname, Node version, shell, cwd. Use when diagnosing environment-dependent problems.",
+      parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "dev_env_report",
+      description:
+        "Probe ~85 developer toolchains in parallel across 16 categories (JS/TS, Python, PHP, Ruby, Rust, Go, JVM, .NET/C#, C/C++, Perl, other languages, shells/WSL, version control, containers, databases, utilities). Reports version and resolved PATH location for each, flags missing ones per category, and lists broken PATH entries. Use this FIRST when a problem might be a missing dependency or PATH issue.",
+      parameters: {
+        type: "object",
+        properties: {
+          tools: {
+            type: "array",
+            items: { type: "string" },
+            description: "Optional subset of executables to probe (default: the full common toolchain list)",
+          },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "where_is",
+      description: "Locate an executable on PATH (like `where` on Windows / `which -a` on Unix). Returns every match or 'not found'.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Executable name, e.g. 'python' or 'cargo'" },
+        },
+        required: ["name"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "create_markdown_report",
+      description: "Create a markdown report file with a given title and content.",
+      parameters: {
+        type: "object",
+        properties: {
+          filename: { type: "string", description: "File name (e.g., Audit52.md)" },
+          title: { type: "string", description: "Title of the report" },
+          content: { type: "string", description: "Markdown content to write" },
+        },
+        required: ["filename", "title", "content"],
+      },
+    },
+  },
+];
+
+export const impl = {
+  async read_file({ path: p, offset = 1, limit = 2000 }) {
+    const full = resolve(p);
+    if (!fs.existsSync(full)) throw new Error(`File not found: ${p}`);
+    const stat = fs.statSync(full);
+    if (stat.size > 5 * 1024 * 1024) throw new Error(`File too large (${(stat.size / 1024 / 1024).toFixed(1)} MB): ${p}`);
+    const start = Math.max(1, offset);
+    const end = start + limit;
+    const lines = [];
+    let lineNum = 0;
+
+    const stream = createReadStream(full, { encoding: "utf8" });
+    const rl = createInterface({ input: stream, crlfDelay: Infinity });
+
+    for await (const line of rl) {
+      lineNum++;
+      if (lineNum >= end) break; // got all we need — stop reading
+      if (lineNum >= start) {
+        lines.push(`${String(lineNum).padStart(5)}\t${line}`);
+      }
+    }
+
+    stream.destroy(); // ensure file handle is released
+    return clip(lines.join("\n") || "(empty file)");
+  },
+
+  async read_many_files({ paths = [], limit_per_file = 400 }) {
+    if (!Array.isArray(paths) || paths.length === 0) throw new Error("paths must be a non-empty array");
+    const parts = [];
+    for (const p of paths.slice(0, 25)) {
+      try {
+        const content = await impl.read_file({ path: p, offset: 1, limit: limit_per_file });
+        parts.push(`--- ${p} ---\n${content}`);
+      } catch (e) {
+        parts.push(`--- ${p} ---\nERROR: ${e.message}`);
+      }
+    }
+    return clip(parts.join("\n\n"));
+  },
+
+  write_file({ path: p, content }) {
+    const full = resolveForCreate(p);
+    fs.mkdirSync(path.dirname(full), { recursive: true });
+    fs.writeFileSync(full, content);
+    const lines = content.split("\n").length;
+    return `Wrote ${content.length} bytes (${lines} lines) to ${p}`;
+  },
+
+  edit_file({ path: p, old_string, new_string }) {
+    const full = resolve(p);
+    if (!fs.existsSync(full)) throw new Error(`File not found: ${p}`);
+    const text = fs.readFileSync(full, "utf8");
+    const count = text.split(old_string).length - 1;
+    if (count === 0) throw new Error("old_string not found in file");
+    if (count > 1) throw new Error(`old_string matched ${count} times; make it unique`);
+    // Use a function replacer so `$&`, `$\``, `$'`, `$1`, `$$` in new_string are
+    // inserted literally instead of being interpreted as replacement patterns.
+    const newText = text.replace(old_string, () => new_string);
+    fs.writeFileSync(full, newText);
+    const diff = new_string.length - old_string.length;
+    const sign = diff >= 0 ? "+" : "";
+    return `Edited ${p} (${sign}${diff} chars)`;
+  },
+
+  apply_patch({ patch }) {
+    return applyPatchText(patch);
+  },
+
+  list_dir({ path: p = ".", recursive = false }) {
+    const full = resolve(p);
+    if (!fs.existsSync(full)) throw new Error(`Directory not found: ${p}`);
+    if (!fs.statSync(full).isDirectory()) throw new Error(`Not a directory: ${p}`);
+    if (recursive) {
+      const args = [
+        ".",
+        ".",
+        "--type",
+        "f",
+        "--type",
+        "d",
+        "--hidden",
+        "--no-ignore",
+        "--color",
+        "never",
+      ];
+      const r = spawnSync(fdPath(), args, {
+        cwd: full,
+        encoding: "utf8",
+        maxBuffer: 1024 * 1024 * 16,
+      });
+      if (!r.error && r.status === 0) {
+        const entries = (r.stdout || "")
+          .split(/\r?\n/)
+          .filter(Boolean)
+          .map((line) => line.replace(/\\/g, "/").replace(/^\.\//, ""))
+          .map((rel) => {
+            const clean = rel.replace(/\/+$/, "");
+            if (!clean) return clean;
+            try {
+              return fs.statSync(path.join(full, clean)).isDirectory() ? `${clean}/` : clean;
+            } catch {
+              return clean;
+            }
+          })
+          .filter(Boolean)
+          .sort();
+        return clip(entries.join("\n") || "(empty)");
+      }
+
+      // Fallback to recursive Node walk if fd is unavailable.
+      const fallbackEntries = [];
+      function walk(dir, prefix) {
+        const items = fs.readdirSync(dir, { withFileTypes: true });
+        for (const item of items.sort()) {
+          const rel = prefix ? `${prefix}/${item.name}` : item.name;
+          if (item.isDirectory()) {
+            fallbackEntries.push(rel + "/");
+            try { walk(path.join(dir, item.name), rel); } catch { /* skip */ }
+          } else {
+            fallbackEntries.push(rel);
+          }
+        }
+      }
+      walk(full);
+      return clip(fallbackEntries.join("\n") || "(empty)");
+    }
+    const entries = fs.readdirSync(full, { withFileTypes: true });
+    return clip(
+      entries
+        .map((e) => (e.isDirectory() ? `${e.name}/` : e.name))
+        .sort()
+        .join("\n") || "(empty)"
+    );
+  },
+
+  search({ pattern, path: p = ".", glob, case_insensitive = false, context = 0 }) {
+    const args = ["--line-number", "--no-heading", "--color", "never", "-e", pattern];
+    if (case_insensitive) args.push("-i");
+    if (context > 0) args.push("-C", String(context));
+    if (glob) args.push("--glob", glob);
+    args.push(resolve(p));
+    const r = spawnSync(rgPath(), args, { encoding: "utf8", maxBuffer: 1024 * 1024 * 16 });
+    if (r.error) {
+      // Node.js fallback when rg is unavailable.
+      try {
+        return clip(searchFallback(pattern, resolve(p), glob, case_insensitive));
+      } catch (e) {
+        return "search unavailable: " + r.error.message;
+      }
+    }
+    if (r.status === 1) return "(no matches)";
+    return clip(r.stdout || r.stderr || "(no matches)");
+  },
+
+  find_files({ pattern = ".", path: p = ".", type, max_depth, extension, respect_gitignore = false }) {
+    const full = resolve(p);
+    if (!fs.existsSync(full)) throw new Error(`Directory not found: ${p}`);
+    if (!fs.statSync(full).isDirectory()) throw new Error(`Not a directory: ${p}`);
+
+    const args = ["--color", "never", "--hidden"];
+    if (!respect_gitignore) args.push("--no-ignore");
+    if (Number.isInteger(max_depth) && max_depth >= 0) {
+      args.push("--max-depth", String(max_depth));
+    }
+
+    if (type) {
+      const t = String(type).toLowerCase();
+      if (t === "f" || t === "file") args.push("--type", "f");
+      else if (t === "d" || t === "dir" || t === "directory") args.push("--type", "d");
+      else if (t === "symlink" || t === "l") args.push("--type", "l");
+      else throw new Error(`Unsupported type: ${type}. Use f, d, or symlink.`);
+    }
+
+    if (extension) {
+      for (const ext of String(extension).split(",").map(s => s.trim()).filter(Boolean)) {
+        args.push("--extension", ext);
+      }
+    }
+
+    if (/[*?\[\]{}]/.test(pattern)) args.push("--glob");
+
+    args.push(pattern, ".");
+
+    const r = spawnSync(fdPath(), args, {
+      cwd: full,
+      encoding: "utf8",
+      maxBuffer: 1024 * 1024 * 16,
+    });
+    if (r.error) return "find_files unavailable: " + r.error.message;
+    if (r.status === 1) return "(no matches)";
+    if (r.status && r.status !== 0) return clip(r.stderr || `fd exited with code ${r.status}`);
+
+    const out = (r.stdout || "")
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((line) => line.replace(/\\/g, "/").replace(/^\.\//, ""))
+      .join("\n");
+    return clip(out || "(no matches)");
+  },
+
+  run_shell({ command, timeout_ms = 120000, allow_unsafe = false, dry_run = false }) {
+    return runShellCommand({ command, timeout_ms, allow_unsafe, dry_run });
+  },
+
+  run_test({ command = "npm test", timeout_ms = 120000, allow_unsafe = false, dry_run = false }) {
+    return runShellCommand({ command, timeout_ms, allow_unsafe, dry_run });
+  },
+
+  jq_query({ filter, path: p, raw = false }) {
+    const full = resolve(p);
+    if (!fs.existsSync(full)) throw new Error(`File not found: ${p}`);
+    const args = [filter];
+    if (raw) args.push("-r");
+    args.push(full);
+    const r = spawnSync(jqPath(), args, {
+      encoding: "utf8",
+      maxBuffer: 1024 * 1024 * 16,
+      cwd: process.cwd(),
+    });
+    if (r.error) return "jq unavailable: " + r.error.message;
+    if (r.status !== 0) return clip(r.stderr || `jq exited with code ${r.status}`);
+    const out = (r.stdout || "").trimEnd();
+    return clip(out || "(null or empty result)");
+  },
+
+  project_inspect({ path: p = ".", max_depth = 2 } = {}) {
+    return inspectProject(p, max_depth);
+  },
+
+  git_status() {
+    const branch = runGit(["branch", "--show-current"]);
+    const status = runGit(["status", "--short"]);
+    return clip(`branch: ${branch.trim() || "(detached or unknown)"}\n${status.trim() || "working tree clean"}`);
+  },
+
+  git_diff({ path: p, staged = false, stat = false } = {}) {
+    const args = ["diff"];
+    if (staged) args.push("--staged");
+    if (stat) args.push("--stat");
+    if (p) {
+      resolve(p);
+      args.push("--", p);
+    }
+    return runGit(args) || "(no diff)";
+  },
+
+  git_commit({ message, paths = [], all = false }) {
+    if (!message || !String(message).trim()) throw new Error("commit message is required");
+    if (all) {
+      runGit(["add", "-A"]);
+    } else {
+      const selected = Array.isArray(paths) ? paths : [];
+      if (!selected.length) throw new Error("provide paths or set all=true");
+      for (const p of selected) resolve(p);
+      runGit(["add", "--", ...selected]);
+    }
+    const out = runGit(["commit", "-m", String(message)]);
+    return clip(out);
+  },
+
+  project_todo(args) {
+    return projectTodo(args);
+  },
+
+  start_process({ command, cwd = ".", name, allow_unsafe = false }) {
+    return startManagedProcess({ command, cwd, name, allow_unsafe });
+  },
+
+  process_status({ id, logs } = {}) {
+    return processStatus({ id, logs });
+  },
+
+  stop_process({ id }) {
+    return stopManagedProcess(id);
+  },
+  memory_save({ text, tags = [] }) {
+    if (!text || !String(text).trim()) throw new Error("text is required");
+    const rec = {
+      id: "m" + Date.now().toString(36) + Math.floor(Math.random() * 100),
+      text: String(text).trim(),
+      tags: Array.isArray(tags) ? tags.map(String) : [],
+      createdAt: new Date().toISOString(),
+    };
+    fs.mkdirSync(path.dirname(memoryFile()), { recursive: true });
+    fs.appendFileSync(memoryFile(), JSON.stringify(rec) + "\n");
+    return `Saved memory ${rec.id}: ${rec.text.slice(0, 120)}`;
+  },
+
+  memory_search({ query, limit = 8 }) {
+    if (!query || !String(query).trim()) throw new Error("query is required");
+    const terms = String(query).toLowerCase().split(/\s+/).filter(Boolean);
+    const scored = readMemories()
+      .map((m) => {
+        const hay = (m.text + " " + (m.tags || []).join(" ")).toLowerCase();
+        const score = terms.reduce((n, t) => n + (hay.includes(t) ? 1 : 0), 0);
+        return { m, score };
+      })
+      .filter((x) => x.score > 0)
+      .sort((a, b) => b.score - a.score || (a.m.createdAt < b.m.createdAt ? 1 : -1))
+      .slice(0, Math.max(1, Math.min(Number(limit) || 8, 50)));
+    if (!scored.length) return `(no memories matched "${query}")`;
+    return clip(scored.map(({ m }) => formatMemory(m)).join("\n"));
+  },
+
+  memory_list({ limit = 20 } = {}) {
+    const all = readMemories();
+    if (!all.length) return "(no memories saved yet)";
+    const recent = all.slice(-Math.max(1, Math.min(Number(limit) || 20, 100))).reverse();
+    return clip(`${all.length} memories total, most recent first:\n` + recent.map(formatMemory).join("\n"));
+  },
+
+  memory_forget({ id }) {
+    if (!id) throw new Error("id is required");
+    const all = readMemories();
+    const kept = all.filter((m) => m.id !== id);
+    if (kept.length === all.length) throw new Error(`memory not found: ${id}`);
+    fs.writeFileSync(memoryFile(), kept.map((m) => JSON.stringify(m)).join("\n") + (kept.length ? "\n" : ""));
+    return `Forgot memory ${id}`;
+  },
+
+  system_info() {
+    return systemInfo();
+  },
+
+  dev_env_report({ tools: subset } = {}) {
+    return devEnvReport(subset);
+  },
+
+  where_is({ name }) {
+    return whereIs(name);
+  },
+
+  create_markdown_report({ filename, title, content }) {
+    const full = resolveForCreate(filename);
+    const markdown = `# ${title}
+
+${content}`;
+    fs.mkdirSync(path.dirname(full), { recursive: true });
+    fs.writeFileSync(full, markdown, 'utf8');
+    return `Created markdown report ${filename} with title "${title}"`;
+  },
+};
+
+function stripPatchLine(line, expected) {
+  if (!line.startsWith(expected)) throw new Error(`Malformed patch line: ${line}`);
+  return line.slice(1);
+}
+
+function collectPatchBody(lines, i) {
+  const body = [];
+  while (i < lines.length && !lines[i].startsWith("*** ")) {
+    body.push(lines[i]);
+    i++;
+  }
+  return { body, i };
+}
+
+function patchChunks(body) {
+  const chunks = [];
+  let current = [];
+  for (const line of body) {
+    if (line.startsWith("@@")) {
+      if (current.length) chunks.push(current);
+      current = [];
+    } else {
+      current.push(line);
+    }
+  }
+  if (current.length) chunks.push(current);
+  return chunks.length ? chunks : [body];
+}
+
+function applyUpdateChunk(text, file, body) {
+  const oldLines = [];
+  const newLines = [];
+  for (const line of body) {
+    if (line.startsWith(" ")) {
+      oldLines.push(line.slice(1));
+      newLines.push(line.slice(1));
+    } else if (line.startsWith("-")) {
+      oldLines.push(line.slice(1));
+    } else if (line.startsWith("+")) {
+      newLines.push(line.slice(1));
+    } else if (line === "\\ No newline at end of file") {
+      continue;
+    } else {
+      throw new Error(`Malformed update line: ${line}`);
+    }
+  }
+  const oldText = oldLines.join("\n");
+  const newText = newLines.join("\n");
+  const count = oldText ? text.split(oldText).length - 1 : 0;
+  if (!oldText) throw new Error("Update patch has no context/removal lines");
+  if (count === 0) throw new Error(`Patch context not found in ${path.relative(workspaceRoot(), file)}`);
+  if (count > 1) throw new Error(`Patch context matched ${count} times in ${path.relative(workspaceRoot(), file)}; add more context`);
+  return text.replace(oldText, () => newText);
+}
+
+function applyUpdatePatch(file, body) {
+  let text = fs.readFileSync(file, "utf8");
+  for (const chunk of patchChunks(body)) {
+    text = applyUpdateChunk(text, file, chunk);
+  }
+  fs.writeFileSync(file, text);
+}
+
+function applyPatchText(patch) {
+  const lines = String(patch || "").replace(/\r\n/g, "\n").split("\n");
+  if (lines[0] !== "*** Begin Patch") throw new Error("Patch must start with *** Begin Patch");
+  if (lines[lines.length - 1] === "") lines.pop();
+  if (lines[lines.length - 1] !== "*** End Patch") throw new Error("Patch must end with *** End Patch");
+
+  const changed = [];
+  let i = 1;
+  while (i < lines.length - 1) {
+    const header = lines[i++];
+    if (header.startsWith("*** Add File: ")) {
+      const rel = header.slice("*** Add File: ".length).trim();
+      const full = resolveForCreate(rel);
+      const { body, i: next } = collectPatchBody(lines, i);
+      i = next;
+      if (fs.existsSync(full)) throw new Error(`File already exists: ${rel}`);
+      fs.mkdirSync(path.dirname(full), { recursive: true });
+      fs.writeFileSync(full, body.map((line) => stripPatchLine(line, "+")).join("\n") + "\n");
+      changed.push(`added ${rel}`);
+    } else if (header.startsWith("*** Update File: ")) {
+      const rel = header.slice("*** Update File: ".length).trim();
+      const full = resolve(rel);
+      if (!fs.existsSync(full)) throw new Error(`File not found: ${rel}`);
+      const { body, i: next } = collectPatchBody(lines, i);
+      i = next;
+      applyUpdatePatch(full, body);
+      changed.push(`updated ${rel}`);
+    } else if (header.startsWith("*** Delete File: ")) {
+      const rel = header.slice("*** Delete File: ".length).trim();
+      const full = resolve(rel);
+      if (!fs.existsSync(full)) throw new Error(`File not found: ${rel}`);
+      fs.unlinkSync(full);
+      changed.push(`deleted ${rel}`);
+    } else if (!header.trim()) {
+      continue;
+    } else {
+      throw new Error(`Unsupported patch header: ${header}`);
+    }
+  }
+  return changed.length ? `Patch applied: ${changed.join(", ")}` : "Patch had no changes";
+}
+
+function runGit(args) {
+  const r = spawnSync("git", args, {
+    cwd: process.cwd(),
+    encoding: "utf8",
+    maxBuffer: 1024 * 1024 * 16,
+  });
+  if (r.error) throw new Error(`git unavailable: ${r.error.message}`);
+  const out = [r.stdout, r.stderr].filter(Boolean).join("\n").trim();
+  if (r.status !== 0) throw new Error(out || `git exited with code ${r.status}`);
+  return clip(out);
+}
+
+function readJsonIfExists(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function findExisting(root, names) {
+  return names.filter((name) => fs.existsSync(path.join(root, name)));
+}
+
+function inspectProject(p = ".", maxDepth = 2) {
+  const root = resolve(p);
+  if (!fs.statSync(root).isDirectory()) throw new Error(`Not a directory: ${p}`);
+  const files = new Set();
+  function walk(dir, depth) {
+    if (depth > maxDepth) return;
+    for (const item of fs.readdirSync(dir, { withFileTypes: true })) {
+      if ([".git", "node_modules", ".next", "dist", "build", "__pycache__"].includes(item.name)) continue;
+      const full = path.join(dir, item.name);
+      const rel = path.relative(root, full).replace(/\\/g, "/");
+      if (item.isDirectory()) {
+        files.add(rel + "/");
+        walk(full, depth + 1);
+      } else {
+        files.add(rel);
+      }
+    }
+  }
+  walk(root, 0);
+
+  const entries = [...files].sort();
+  const important = findExisting(root, [
+    "package.json", "pnpm-lock.yaml", "yarn.lock", "package-lock.json", "bun.lockb",
+    "pyproject.toml", "requirements.txt", "Pipfile", "poetry.lock",
+    "Cargo.toml", "go.mod", "composer.json", "Gemfile",
+    "Dockerfile", "docker-compose.yml", "compose.yml",
+    "vercel.json", "next.config.js", "next.config.mjs", "vite.config.js", "vite.config.ts",
+    "tsconfig.json", ".env.example", ".mcp.json",
+  ]);
+
+  const stack = [];
+  const commands = [];
+  const pkg = readJsonIfExists(path.join(root, "package.json"));
+  if (pkg) {
+    stack.push("Node.js");
+    if (pkg.dependencies?.next || pkg.devDependencies?.next) stack.push("Next.js");
+    if (pkg.dependencies?.react || pkg.devDependencies?.react) stack.push("React");
+    if (pkg.devDependencies?.vite || pkg.dependencies?.vite) stack.push("Vite");
+    if (pkg.dependencies?.express) stack.push("Express");
+    for (const [name, cmd] of Object.entries(pkg.scripts || {})) commands.push(`npm run ${name}  # ${cmd}`);
+  }
+  if (important.includes("pyproject.toml") || important.includes("requirements.txt")) stack.push("Python");
+  if (important.includes("Cargo.toml")) stack.push("Rust");
+  if (important.includes("go.mod")) stack.push("Go");
+  if (entries.some((e) => e.endsWith(".csproj") || e.endsWith(".sln"))) stack.push(".NET");
+  if (important.includes("Dockerfile") || important.includes("docker-compose.yml") || important.includes("compose.yml")) stack.push("Docker");
+
+  const packageManager = important.includes("pnpm-lock.yaml")
+    ? "pnpm"
+    : important.includes("yarn.lock")
+      ? "yarn"
+      : important.includes("bun.lockb")
+        ? "bun"
+        : pkg
+          ? "npm"
+          : "(none detected)";
+
+  const testHints = commands.filter((c) => /\b(test|lint|check|typecheck|build)\b/i.test(c));
+  return clip([
+    `root: ${root}`,
+    `stack: ${[...new Set(stack)].join(", ") || "(unknown)"}`,
+    `package manager: ${packageManager}`,
+    "",
+    "important files:",
+    important.length ? important.map((x) => `- ${x}`).join("\n") : "- (none detected)",
+    "",
+    "likely verification commands:",
+    testHints.length ? testHints.map((x) => `- ${x}`).join("\n") : "- inspect package/config files first",
+    "",
+    "top-level scan:",
+    entries.slice(0, 120).map((x) => `- ${x}`).join("\n") || "- (empty)",
+  ].join("\n"));
+}
+
+function appendProcessLog(rec, chunk) {
+  rec.log += chunk;
+  if (rec.log.length > PROCESS_LOG_LIMIT) rec.log = rec.log.slice(-PROCESS_LOG_LIMIT);
+}
+
+function startManagedProcess({ command, cwd = ".", name, allow_unsafe = false }) {
+  const risk = commandRisk(command);
+  if (!allow_unsafe && risk.level === "blocked") {
+    return `BLOCKED: ${risk.reason}\nCommand: ${command}`;
+  }
+  const procCwd = resolve(cwd);
+  const isWin = process.platform === "win32";
+  const shell = isWin ? "powershell.exe" : "/bin/sh";
+  const args = isWin ? ["-NoProfile", "-NonInteractive", "-Command", command] : ["-c", command];
+  const child = spawn(shell, args, {
+    cwd: procCwd,
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  const id = `P${String(nextProcessId++).padStart(3, "0")}`;
+  const rec = {
+    id,
+    name: name || command,
+    command,
+    cwd: procCwd,
+    startedAt: new Date().toISOString(),
+    status: "running",
+    exitCode: null,
+    log: "",
+    child,
+  };
+  child.stdout.on("data", (d) => appendProcessLog(rec, String(d)));
+  child.stderr.on("data", (d) => appendProcessLog(rec, String(d)));
+  child.on("error", (e) => {
+    rec.status = "error";
+    appendProcessLog(rec, `\n[process error: ${e.message}]`);
+  });
+  child.on("exit", (code, signal) => {
+    rec.status = "exited";
+    rec.exitCode = code;
+    appendProcessLog(rec, `\n[exited code=${code} signal=${signal || ""}]`);
+  });
+  managedProcesses.set(id, rec);
+  return `started ${id}: ${rec.name}\nrisk: ${risk.level} (${risk.reason})\ncwd: ${procCwd}`;
+}
+
+function summarizeProcess(rec, includeLogs = false) {
+  const base = [
+    `${rec.id} [${rec.status}] ${rec.name}`,
+    `command: ${rec.command}`,
+    `cwd: ${rec.cwd}`,
+    `started: ${rec.startedAt}`,
+    `exitCode: ${rec.exitCode ?? ""}`,
+  ].join("\n");
+  return includeLogs ? `${base}\nlogs:\n${rec.log.trim() || "(no logs yet)"}` : base;
+}
+
+function processStatus({ id, logs } = {}) {
+  if (id) {
+    const rec = managedProcesses.get(id);
+    if (!rec) throw new Error(`process not found: ${id}`);
+    return clip(summarizeProcess(rec, logs !== false));
+  }
+  if (!managedProcesses.size) return "(no managed processes)";
+  return clip([...managedProcesses.values()].map((rec) => summarizeProcess(rec, Boolean(logs))).join("\n\n"));
+}
+
+function stopManagedProcess(id) {
+  const rec = managedProcesses.get(id);
+  if (!rec) throw new Error(`process not found: ${id}`);
+  if (rec.status === "running") {
+    rec.child.kill();
+    rec.status = "stopping";
+    return `stopping ${id}`;
+  }
+  return `${id} is already ${rec.status}`;
+}
+
+function todoPath() {
+  return resolveForCreate(path.join(".nimagent", "todos.json"));
+}
+
+function readTodos() {
+  try {
+    const data = JSON.parse(fs.readFileSync(todoPath(), "utf8"));
+    return Array.isArray(data.todos) ? data.todos : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeTodos(todos) {
+  const file = todoPath();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify({ todos }, null, 2) + "\n");
+}
+
+function formatTodos(todos) {
+  if (!todos.length) return "(no todos)";
+  return todos.map((t) => `${t.id} [${t.status}] ${t.title}${t.notes ? ` — ${t.notes}` : ""}`).join("\n");
+}
+
+function projectTodo({ action, id, title, status, notes } = {}) {
+  const todos = readTodos();
+  const now = new Date().toISOString();
+  const act = String(action || "").toLowerCase();
+  if (act === "list") return formatTodos(todos);
+  if (act === "add") {
+    if (!title) throw new Error("title is required for add");
+    const nextId = `T${String(todos.length + 1).padStart(3, "0")}`;
+    const todo = { id: nextId, title, status: status || "pending", notes: notes || "", createdAt: now, updatedAt: now };
+    todos.push(todo);
+    writeTodos(todos);
+    return `Added ${nextId}: ${title}`;
+  }
+  if (act === "update" || act === "done" || act === "remove") {
+    const idx = todos.findIndex((t) => t.id === id);
+    if (idx === -1) throw new Error(`todo not found: ${id}`);
+    if (act === "remove") {
+      const [removed] = todos.splice(idx, 1);
+      writeTodos(todos);
+      return `Removed ${removed.id}: ${removed.title}`;
+    }
+    if (title) todos[idx].title = title;
+    if (notes !== undefined) todos[idx].notes = notes;
+    todos[idx].status = act === "done" ? "done" : status || todos[idx].status;
+    todos[idx].updatedAt = now;
+    writeTodos(todos);
+    return `Updated ${todos[idx].id}: ${todos[idx].status} ${todos[idx].title}`;
+  }
+  if (act === "clear") {
+    writeTodos([]);
+    return "Cleared project todos";
+  }
+  throw new Error("action must be list, add, update, done, remove, or clear");
+}
+
+export async function runTool(name, args) {
+  const fn = impl[name];
+  if (!fn) {
+    throw new Error(`Unknown tool: ${name}. Valid tools: ${Object.keys(impl).sort().join(", ")}`);
+  }
+  return await fn(args || {});
+}
+
+// ---------------------------------------------------------------------------
+// Persistent memory — one JSON record per line in <HOME>/memory.jsonl.
+// Survives across sessions and working directories.
+// ---------------------------------------------------------------------------
+
+function memoryFile() {
+  return path.join(HOME, "memory.jsonl");
+}
+
+function readMemories() {
+  try {
+    return fs
+      .readFileSync(memoryFile(), "utf8")
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((line) => { try { return JSON.parse(line); } catch { return null; } })
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function formatMemory(m) {
+  const tags = m.tags?.length ? ` [${m.tags.join(", ")}]` : "";
+  return `- (${m.id}, ${String(m.createdAt).slice(0, 10)})${tags} ${m.text}`;
+}
+
+// Injected into the system prompt at startup so recent memories are always in
+// context. Returns "" when nothing is saved.
+export function memoryPreamble(limit = 15) {
+  const all = readMemories();
+  if (!all.length) return "";
+  const recent = all.slice(-limit).reverse();
+  return [
+    "",
+    "# Persistent memories",
+    `You have ${all.length} saved memories; the most recent are below. Use memory_search for older ones,`,
+    "memory_save to record new durable facts, and memory_forget to remove wrong/obsolete ones.",
+    ...recent.map(formatMemory),
+  ].join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// System / environment diagnostics
+// ---------------------------------------------------------------------------
+
+function systemInfo() {
+  const gb = (b) => (b / 1024 ** 3).toFixed(1) + " GB";
+  const cpus = os.cpus();
+  const lines = [
+    `hostname: ${os.hostname()}`,
+    `platform: ${process.platform} ${os.release()} (${os.arch()})`,
+    `cpu: ${cpus[0]?.model?.trim() || "unknown"} × ${cpus.length} logical cores`,
+    `memory: ${gb(os.freemem())} free of ${gb(os.totalmem())}`,
+    `node: ${process.version}`,
+    `shell: ${process.platform === "win32" ? "powershell.exe" : process.env.SHELL || "/bin/sh"}`,
+    `cwd: ${process.cwd()}`,
+    `home: ${os.homedir()}`,
+  ];
+  if (process.platform === "win32") {
+    const ps = [
+      "$o = Get-CimInstance Win32_OperatingSystem;",
+      "$g = (Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name) -join ', ';",
+      "$d = Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | ForEach-Object { '{0} {1:N0} GB free of {2:N0} GB' -f $_.DeviceID, ($_.FreeSpace/1GB), ($_.Size/1GB) };",
+      "@{ os = ($o.Caption + ' build ' + $o.BuildNumber); gpu = $g; disks = @($d) } | ConvertTo-Json -Compress",
+    ].join(" ");
+    const r = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", ps], {
+      encoding: "utf8",
+      timeout: 20000,
+      windowsHide: true,
+    });
+    try {
+      const info = JSON.parse(r.stdout);
+      lines.push(`os: ${info.os}`);
+      lines.push(`gpu: ${info.gpu || "unknown"}`);
+      const disks = Array.isArray(info.disks) ? info.disks : [info.disks].filter(Boolean);
+      lines.push(`disks: ${disks.join(" | ")}`);
+    } catch { lines.push("(detailed OS/GPU/disk info unavailable — CIM query failed)"); }
+  } else {
+    const r = spawnSync("uname", ["-a"], { encoding: "utf8", timeout: 5000 });
+    if (!r.error && r.stdout) lines.push(`uname: ${r.stdout.trim()}`);
+  }
+  return clip(lines.join("\n"));
+}
+
+// Comprehensive toolchain matrix, grouped by category. Value is the version
+// argument; null means "detect presence only" (the version command is too slow
+// or unreliable to run — e.g. flutter/gradle/sbt boot a VM).
+const TOOLCHAINS = [
+  ["JavaScript / TypeScript", { node: "--version", npm: "--version", pnpm: "--version", yarn: "--version", bun: "--version", deno: "--version", tsc: "--version", nvm: "version" }],
+  ["Python", { python: "--version", py: "--version", pip: "--version", pipx: "--version", poetry: "--version", uv: "--version", conda: "--version" }],
+  ["PHP", { php: "-v", composer: "--version" }],
+  ["Ruby", { ruby: "--version", gem: "--version", bundle: "--version", rails: null }],
+  ["Rust", { rustc: "--version", cargo: "--version", rustup: "--version" }],
+  ["Go", { go: "version", gofmt: null }],
+  ["JVM (Java/Kotlin/Scala)", { java: "-version", javac: "-version", mvn: "--version", gradle: null, kotlin: null, kotlinc: null, scala: null, sbt: null }],
+  [".NET / C#", { dotnet: "--version", msbuild: "-version", nuget: null }],
+  ["C / C++", { gcc: "--version", "g++": "--version", clang: "--version", "clang++": "--version", cl: null, cmake: "--version", make: "--version", ninja: "--version", gdb: "--version", vcpkg: null, conan: "--version" }],
+  ["Perl", { perl: "-v", cpan: null }],
+  ["Other languages", { lua: "-v", julia: "--version", dart: "--version", flutter: null, swift: null, zig: "version", nim: "--version", elixir: null, erl: null, ghc: "--version", Rscript: "--version" }],
+  ["Shells & OS", { pwsh: "--version", powershell: null, bash: "--version", wsl: "--status", ssh: "-V" }],
+  ["Version control", { git: "--version", gh: "--version", svn: "--version" }],
+  ["Containers & infra", { docker: "--version", "docker-compose": "--version", podman: "--version", kubectl: null, helm: null, terraform: null }],
+  ["Databases", { mysql: "--version", psql: "--version", sqlite3: "--version", mongosh: null, "redis-cli": "--version" }],
+  ["Utilities", { curl: "--version", wget: "--version", tar: "--version", jq: "--version", code: null }],
+];
+
+// Run a shell command, capture stdout+stderr, resolve "" on error/timeout.
+// shell:true so Windows .cmd/.bat shims (npm, tsc, ...) resolve via PATHEXT.
+function runQuiet(cmd, timeout = 5000) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(cmd, [], { shell: true, windowsHide: true });
+    } catch {
+      return resolve("");
+    }
+    let out = "";
+    const timer = setTimeout(() => { try { child.kill(); } catch { /* gone */ } }, timeout);
+    child.stdout.on("data", (d) => { if (out.length < 8192) out += d; });
+    child.stderr.on("data", (d) => { if (out.length < 8192) out += d; });
+    child.on("error", () => { clearTimeout(timer); resolve(""); });
+    child.on("close", () => { clearTimeout(timer); resolve(out); });
+  });
+}
+
+async function resolveOnPath(name) {
+  const isWin = process.platform === "win32";
+  const out = await runQuiet(isWin ? `where.exe ${name}` : `which -a ${name}`, 8000);
+  // wsl and friends can emit UTF-16 (strip NULs); keep only path-shaped lines.
+  return out
+    .replace(/\u0000/g, "")
+    .split(/\r?\n/)
+    .map((s) => s.trim())
+    .filter((s) => /^([A-Za-z]:[\\/]|\/)/.test(s));
+}
+
+async function probeVersion(name, versionArg) {
+  // java/perl/ssh print the version to stderr; strip UTF-16 NULs (wsl).
+  const out = (await runQuiet(`${name} ${versionArg}`, 5000)).replace(/\u0000/g, "");
+  const first = out.split(/\r?\n/).map((s) => s.trim()).filter(Boolean)[0] || "";
+  return first.slice(0, 100);
+}
+
+// Run fn over items with bounded concurrency (order-preserving results).
+async function mapLimit(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const idx = next++;
+      results[idx] = await fn(items[idx]);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
+async function devEnvReport(subset) {
+  // Flatten the matrix; unknown names from an explicit subset still get probed.
+  const wanted = Array.isArray(subset) && subset.length ? new Set(subset.map(String)) : null;
+  const probes = [];
+  for (const [cat, items] of TOOLCHAINS) {
+    for (const [name, versionArg] of Object.entries(items)) {
+      if (!wanted || wanted.has(name)) probes.push({ cat, name, versionArg });
+    }
+  }
+  if (wanted) {
+    for (const name of wanted) {
+      if (!probes.some((p) => p.name === name)) probes.push({ cat: "Requested", name, versionArg: "--version" });
+    }
+  }
+
+  const results = await mapLimit(probes, 10, async (p) => {
+    const paths = await resolveOnPath(p.name);
+    if (!paths.length) return { ...p, found: false };
+    const version = p.versionArg == null ? "" : await probeVersion(p.name, p.versionArg);
+    return { ...p, found: true, paths, version };
+  });
+
+  const categories = [...TOOLCHAINS.map(([cat]) => cat), "Requested"];
+  const lines = [];
+  let foundCount = 0;
+  for (const cat of categories) {
+    const group = results.filter((r) => r.cat === cat);
+    if (!group.length) continue;
+    const found = group.filter((r) => r.found);
+    const missing = group.filter((r) => !r.found).map((r) => r.name);
+    foundCount += found.length;
+    lines.push(`[${cat}]`);
+    for (const r of found) {
+      const extra = r.paths.length > 1 ? ` (+${r.paths.length - 1} more)` : "";
+      lines.push(`  ${r.name.padEnd(15)} ${(r.version || "(installed)").padEnd(42)} ${r.paths[0]}${extra}`);
+    }
+    if (missing.length) lines.push(`  missing: ${missing.join(", ")}`);
+    lines.push("");
+  }
+
+  // PATH health: flag entries pointing at directories that don't exist.
+  const pathEntries = (process.env.PATH || "").split(path.delimiter).filter(Boolean);
+  const broken = pathEntries.filter((p) => { try { return !fs.existsSync(p); } catch { return true; } });
+
+  return clip([
+    `Developer environment — ${foundCount} of ${probes.length} toolchains found`,
+    "",
+    ...lines,
+    `PATH entries: ${pathEntries.length}${broken.length ? ` — ${broken.length} point at missing directories:` : " (all directories exist)"}`,
+    ...broken.map((p) => `  broken: ${p}`),
+  ].join("\n"));
+}
+
+async function whereIs(name) {
+  if (!name || !String(name).trim()) throw new Error("name is required");
+  const paths = await resolveOnPath(String(name).trim());
+  if (!paths.length) return `${name}: not found on PATH`;
+  return clip(paths.join("\n"));
+}
+
+function searchFallback(pattern, searchPath, glob, caseInsensitive) {
+  const flags = caseInsensitive ? "gi" : "g";
+  const re = new RegExp(pattern, flags);
+  const results = [];
+  const globRe = glob ? globToRegex(glob) : null;
+
+  function walk(dir) {
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name !== "node_modules" && entry.name !== ".git") walk(full);
+      } else if (entry.isFile()) {
+        if (globRe && !globRe.test(entry.name)) continue;
+        try {
+          const content = fs.readFileSync(full, "utf8");
+          const lines = content.split(/\r?\n/);
+          const rel = path.relative(searchPath, full).replace(/\\/g, "/");
+          for (let i = 0; i < lines.length; i++) {
+            if (re.test(lines[i])) {
+              results.push(`${rel}:${i + 1}:${lines[i]}`);
+              if (results.length > 500) return;
+            }
+            re.lastIndex = 0;
+          }
+        } catch { /* skip unreadable files */ }
+      }
+    }
+  }
+
+  if (fs.statSync(searchPath).isFile()) {
+    const content = fs.readFileSync(searchPath, "utf8");
+    const lines = content.split(/\r?\n/);
+    for (let i = 0; i < lines.length; i++) {
+      if (re.test(lines[i])) results.push(`${i + 1}:${lines[i]}`);
+      re.lastIndex = 0;
+    }
+  } else {
+    walk(searchPath);
+  }
+  return results.length ? results.join("\n") : "(no matches)";
+}
+
+function globToRegex(g) {
+  const s = g.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".");
+  return new RegExp(`^${s}$`, "i");
+}
+
+// Load extension modules and merge their tools + impls into the registry.
+// Each extension default-exports { name, tools: [...], impl: { name: fn } }.
+export async function registerExtensions(root, files = []) {
+  const loaded = [];
+  for (const rel of files) {
+    try {
+      const url = pathToFileURL(path.join(root, rel)).href;
+      const mod = await import(url);
+      const ext = mod.default || mod;
+      if (Array.isArray(ext.tools)) {
+        for (const t of ext.tools) tools.push(t);
+      }
+      if (ext.impl && typeof ext.impl === "object") {
+        Object.assign(impl, ext.impl);
+      }
+      loaded.push(ext.name || rel);
+    } catch (e) {
+      loaded.push(`${rel} (failed: ${e.message})`);
+    }
+  }
+  return loaded;
+}

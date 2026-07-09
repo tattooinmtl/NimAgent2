@@ -1,0 +1,62 @@
+{"text":"fix the bug in app.js","label":"coding"}
+{"text":"refactor the auth module to use async/await","label":"coding"}
+{"text":"why is my build failing with error TS2345","label":"coding"}
+{"text":"write a unit test for the payment service","label":"coding"}
+{"text":"implement a rate limiter in middleware.py","label":"coding"}
+{"text":"the server crashes with ECONNRESET on line 42","label":"coding"}
+{"text":"add a Dockerfile for this project","label":"coding"}
+{"text":"migrate the database schema to add a users table","label":"coding"}
+{"text":"optimize the SQL query in reports.py — it's slow","label":"coding"}
+{"text":"set up CI with GitHub Actions for this repo","label":"coding"}
+{"text":"how do I configure webpack to split chunks","label":"coding"}
+{"text":"debug why fetch() returns 401 on the /api/login route","label":"coding"}
+{"text":"create a REST endpoint for uploading files","label":"coding"}
+{"text":"lint errors in src/utils.ts — can you fix them","label":"coding"}
+{"text":"write a regex to validate email addresses in Python","label":"coding"}
+{"text":"update the npm packages to fix the security advisory","label":"coding"}
+{"text":"add TypeScript types to the response object","label":"coding"}
+{"text":"read config.json and tell me what providers are set","label":"coding"}
+{"text":"the test suite fails on Windows — path separator issue","label":"coding"}
+{"text":"deploy the app to Vercel using the CLI","label":"coding"}
+{"text":"write a shell script to back up the database nightly","label":"coding"}
+{"text":"parse the CSV file and load it into SQLite","label":"coding"}
+{"text":"generate a JWT token with a 24h expiry","label":"coding"}
+{"text":"set up husky pre-commit hooks for eslint","label":"coding"}
+{"text":"what does the __init__.py file do","label":"coding"}
+{"text":"add error handling to the file upload function","label":"coding"}
+{"text":"the pip install fails — dependency conflict","label":"coding"}
+{"text":"what is async/await and how does it work in JavaScript","label":"assistant"}
+{"text":"explain what a closure is in Python","label":"assistant"}
+{"text":"what's the difference between REST and GraphQL","label":"assistant"}
+{"text":"summarize the key points of the twelve-factor app methodology","label":"assistant"}
+{"text":"what are the pros and cons of microservices","label":"assistant"}
+{"text":"explain how TCP/IP works at a high level","label":"assistant"}
+{"text":"what is the CAP theorem","label":"assistant"}
+{"text":"tell me about the history of Linux","label":"assistant"}
+{"text":"what is machine learning","label":"assistant"}
+{"text":"how does HTTPS encryption work","label":"assistant"}
+{"text":"what's the best programming language to learn first","label":"assistant"}
+{"text":"explain the difference between a process and a thread","label":"assistant"}
+{"text":"what is a monad in functional programming","label":"assistant"}
+{"text":"compare PostgreSQL and MySQL","label":"assistant"}
+{"text":"what are design patterns and why do they matter","label":"assistant"}
+{"text":"summarize this article for me","label":"assistant"}
+{"text":"translate this text to French","label":"assistant"}
+{"text":"write me a poem about debugging at 3am","label":"assistant"}
+{"text":"what is the meaning of life","label":"assistant"}
+{"text":"give me a list of the top 10 JavaScript frameworks","label":"assistant"}
+{"text":"explain dependency injection to a beginner","label":"assistant"}
+{"text":"what is the difference between Docker and a VM","label":"assistant"}
+{"text":"how does garbage collection work","label":"assistant"}
+{"text":"what are the SOLID principles","label":"assistant"}
+{"text":"can you explain what a neural network is","label":"assistant"}
+{"text":"edit src/auth.py to validate the token expiry","label":"coding"}
+{"text":"write a python script to rename all files in a folder","label":"coding"}
+{"text":"add logging to the worker process","label":"coding"}
+{"text":"search the codebase for all usages of deprecated API","label":"coding"}
+{"text":"what is the output of this Python code snippet","label":"assistant"}
+{"text":"review my code and suggest improvements","label":"coding"}
+{"text":"git rebase main and resolve the conflict in package.json","label":"coding"}
+{"text":"what's a good way to structure a Node.js project","label":"assistant"}
+{"text":"create a makefile for this C project","label":"coding"}
+{"text":"install the missing dependencies and run the tests","label":"coding"}

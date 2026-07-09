@@ -1,0 +1,22 @@
+{
+  "name": "forge-yellow",
+  "description": "Molten-forge palette: yellow at the top cooling into dark orange and purple.",
+  "accent": [255, 176, 0],
+  "prompt": "cyan",
+  "logoGradient": [
+    [255, 214, 0],
+    [255, 205, 0],
+    [255, 176, 0],
+    [255, 110, 0],
+    [206, 64, 120],
+    [150, 32, 210]
+  ],
+  "ui": {
+    "user": "cyan",
+    "assistant": "magenta",
+    "tool": "green",
+    "error": "red",
+    "warn": "yellow",
+    "dim": "gray"
+  }
+}

@@ -1,0 +1,96 @@
+// NimAgent settings template.
+//
+// NimAgent generates a real settings.json on first run inside its home dir
+// (<install>/agent/settings.json, or %NIMAGENT_HOME%/settings.json). That file
+// is git-ignored and holds YOUR keys — never commit it.
+//
+// To use this template: copy it to that location and fill in your keys, OR just
+// run NimAgent once and set keys from the REPL with `/apikey <provider> <key>`.
+// Only whole-line `//` comments are supported. Keys may also come from
+// environment variables (NIMAGENT_<PROVIDER>_KEY), which override the file.
+{
+  "defaultProvider": "nvidia",
+  "defaultModel": "nvidia/glm-5.2",
+  "reasoning": "medium",
+  "maxToolIterations": 30,
+  "diffPreview": true,
+
+  // Each provider is an OpenAI-compatible /chat/completions endpoint.
+  // Leave apiKey "" and set it later; "not-needed" marks a keyless local server.
+  "providers": {
+    // free key: https://build.nvidia.com
+    "nvidia": {
+      "baseUrl": "https://integrate.api.nvidia.com/v1",
+      "apiKey": "",
+      "api": "openai-completions",
+      "nativeTools": false
+    },
+    "openai": {
+      "baseUrl": "https://api.openai.com/v1",
+      "apiKey": ""
+    },
+    "openrouter": {
+      "baseUrl": "https://openrouter.ai/api/v1",
+      "apiKey": "",
+      "reasoningParam": "none"
+    },
+    "groq": {
+      "baseUrl": "https://api.groq.com/openai/v1",
+      "apiKey": "",
+      "reasoningParam": "none"
+    },
+    "deepseek": {
+      "baseUrl": "https://api.deepseek.com/v1",
+      "apiKey": ""
+    },
+    "google": {
+      "baseUrl": "https://generativelanguage.googleapis.com/v1beta/openai",
+      "apiKey": ""
+    },
+    "xai": {
+      "baseUrl": "https://api.x.ai/v1",
+      "apiKey": ""
+    },
+    "mistral": {
+      "baseUrl": "https://api.mistral.ai/v1",
+      "apiKey": "",
+      "reasoningParam": "none"
+    },
+    "ollama": {
+      "baseUrl": "http://localhost:11434/v1",
+      "apiKey": "not-needed",
+      "reasoningParam": "none"
+    },
+    // bundled llama.cpp server — no key required
+    "local": {
+      "baseUrl": "http://localhost:8080/v1",
+      "apiKey": "not-needed",
+      "reasoningParam": "none"
+    }
+  },
+
+  // Model catalog: <key> -> { provider, id, maxTokens }. Switch with /model <key>.
+  "models": {
+    "nvidia/glm-5.2":       { "provider": "nvidia",     "id": "z-ai/glm-5.2",                "maxTokens": 16384 },
+    "nvidia/llama-3.3-70b": { "provider": "nvidia",     "id": "meta/llama-3.3-70b-instruct", "maxTokens": 4096 },
+    "openai/gpt-4.1":       { "provider": "openai",     "id": "gpt-4.1",                     "maxTokens": 16384 },
+    "openai/o4-mini":       { "provider": "openai",     "id": "o4-mini",                     "maxTokens": 16384, "reasoning": true },
+    "openrouter/sonnet":    { "provider": "openrouter", "id": "anthropic/claude-3.5-sonnet", "maxTokens": 8192 },
+    "local/coder":          { "provider": "local",      "id": "your-model-name",             "maxTokens": 8192 }
+  },
+
+  // Local llama.cpp server (drives the "local" provider). Point modelsDir at your
+  // own folder of .gguf files; manage with /llama list|start|stop|status.
+  // binDir "" defaults to <install>/llama. contextSize 0 = read from GGUF header.
+  // ngl is GPU layers (0 = CPU only). defaultModel loads on a bare /llama start.
+  "llama": {
+    "binDir": "",
+    "modelsDir": "C:\\models",
+    "host": "127.0.0.1",
+    "port": 8080,
+    "contextSize": 8192,
+    "ngl": 99,
+    "defaultModel": "",
+    "extraArgs": []
+  }
+}

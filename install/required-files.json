@@ -1,0 +1,11 @@
+[
+  "bin/nimagent.mjs",
+  "src/agent.mjs",
+  "src/config.mjs",
+  "src/router.mjs",
+  "src/tools.mjs",
+  "scripts/setup.mjs",
+  "package.json",
+  "nimagent.config.json",
+  "settings.example.json"
+]

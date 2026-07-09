@@ -1,0 +1,100 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://nimagent.local/schema/nimagent.config.schema.json",
+  "title": "NimAgent project config",
+  "description": "Top-level configuration for a NimAgent project (nimagent.config.json).",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+    "promptFile": {
+      "type": "string",
+      "description": "Path (relative to project root) to the system prompt markdown file."
+    },
+    "theme": {
+      "type": "string",
+      "description": "Path to a theme JSON file (see themes/)."
+    },
+    "extensions": {
+      "type": "array",
+      "description": "Extension JS modules to load. Each default-exports { name, tools, impl }.",
+      "items": { "type": "string" }
+    },
+    "skills": {
+      "type": "array",
+      "description": "Skill directories. Each contains a SKILL.md with frontmatter (name, command, description).",
+      "items": { "type": "string" }
+    },
+    "autoDiscoverSkills": {
+      "type": "boolean",
+      "description": "When true, auto-discover skill directories by scanning skills/**/SKILL.md."
+    },
+    "registry": {
+      "type": "string",
+      "description": "Base URL of the package registry. `nimagent install <name>` reads <registry>/registry.json and downloads from <registry>/downloads/."
+    },
+    "mcpServers": {
+      "type": "object",
+      "description": "MCP servers exposed through the `mcp` proxy tool. Keyed by server name. Also read from a project-local .mcp.json (which takes precedence).",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "command": { "type": "string", "description": "Executable for the stdio transport." },
+          "args": { "type": "array", "items": { "type": "string" } },
+          "env": { "type": "object", "additionalProperties": { "type": "string" } },
+          "cwd": { "type": "string" },
+          "url": { "type": "string", "description": "HTTP endpoint (StreamableHTTP) — alternative to command/args." },
+          "headers": { "type": "object", "additionalProperties": { "type": "string" } },
+          "directTools": {
+            "description": "true | string[] of tool names to register as first-class mcp__<server>__<tool> tools. Default: proxy-only.",
+            "oneOf": [{ "type": "boolean" }, { "type": "array", "items": { "type": "string" } }]
+          },
+          "excludeTools": { "type": "array", "items": { "type": "string" } },
+          "debug": { "type": "boolean", "description": "Print server stderr." }
+        }
+      }
+    },
+    "mcp": {
+      "type": "object",
+      "description": "Global MCP settings.",
+      "properties": {
+        "idleTimeout": { "type": "number", "description": "Minutes before an idle server disconnects (0 disables). Default 10." },
+        "directTools": {
+          "description": "Default directTools behavior for all servers (per-server overrides).",
+          "oneOf": [{ "type": "boolean" }, { "type": "array", "items": { "type": "string" } }]
+        }
+      }
+    },
+    "router": {
+      "type": "object",
+      "description": "Intent router — classifies each turn as coding or assistant using a warm Python sidecar + local ML.",
+      "properties": {
+        "enabled": { "type": "boolean", "description": "Activate the intent router. Default false." },
+        "mode": { "type": "string", "enum": ["auto", "manual"], "description": "auto: classify every turn. manual: only change via /route." },
+        "default": { "type": "string", "enum": ["coding", "assistant"], "description": "Default persona when confidence is below threshold." },
+        "python": {
+          "type": "object",
+          "properties": {
+            "interpreter": { "type": "string", "description": "Path to python executable or venv python." },
+            "confidenceThreshold": { "type": "number", "description": "Minimum confidence to accept a classification (0-1). Default 0.60." },
+            "timeoutMs": { "type": "number", "description": "MS to wait for sidecar before falling back to JS heuristics. Default 150." }
+          }
+        }
+      }
+    },
+    "bridge": {
+      "type": "object",
+      "description": "NimTools bridge — exposes the hermes capability set (browser, computer_use, media, memory, etc.) via a single nimtools proxy tool.",
+      "properties": {
+        "enabled": { "type": "boolean", "description": "Register the nimtools proxy tool. Default false." },
+        "hermesRoot": { "type": "string", "description": "Absolute path to the hermes-agent directory. Default C:\\hermes-agent." },
+        "python": {
+          "type": "object",
+          "properties": {
+            "interpreter": { "type": "string", "description": "Path to python executable (preferably hermes venv python)." }
+          }
+        }
+      }
+    }
+  }
+}

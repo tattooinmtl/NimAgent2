@@ -1,0 +1,43 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://nimagent.local/schema/nimpkg.schema.json",
+  "title": "NimAgent package manifest",
+  "description": "nimpkg.json — the manifest at the root of a NimAgent package zip.",
+  "type": "object",
+  "required": ["name", "type"],
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Package name. Used as the install id and the install location (skills/<name>, extensions/<name>.js, mcpServers.<name>).",
+      "pattern": "^[a-z0-9][a-z0-9-]*$"
+    },
+    "version": { "type": "string", "description": "Semver-ish version string." },
+    "type": {
+      "type": "string",
+      "enum": ["skill", "extension", "mcp"],
+      "description": "skill = SKILL.md folder; extension = JS tool module; mcp = external MCP server."
+    },
+    "description": { "type": "string" },
+    "command": { "type": "string", "description": "Slash command for skills, e.g. /pdf." },
+    "entry": { "type": "string", "description": "Extension only: the JS file inside the zip to install as extensions/<name>.js." },
+    "mcp": {
+      "type": "object",
+      "description": "MCP only: server definition copied into mcpServers.<name>.",
+      "properties": {
+        "transport": { "type": "string", "enum": ["stdio", "http"] },
+        "command": { "type": "string" },
+        "args": { "type": "array", "items": { "type": "string" } },
+        "env": { "type": "object", "additionalProperties": { "type": "string" } },
+        "url": { "type": "string" },
+        "headers": { "type": "object", "additionalProperties": { "type": "string" } },
+        "directTools": {
+          "oneOf": [{ "type": "boolean" }, { "type": "array", "items": { "type": "string" } }]
+        }
+      }
+    }
+  },
+  "allOf": [
+    { "if": { "properties": { "type": { "const": "extension" } } }, "then": { "required": ["entry"] } },
+    { "if": { "properties": { "type": { "const": "mcp" } } }, "then": { "required": ["mcp"] } }
+  ]
+}
