@@ -304,6 +304,77 @@ await assert("deps rejects unknown manager",
   r => String(r).startsWith("ERROR:") && String(r).includes("unsupported manager")
 );
 
+// ── Test 9: coverage + security scan ──────────────────────────────
+console.log("\nTest 9: test_coverage + security_scan");
+
+await assert("test_coverage auto-detects a Node coverage command",
+  await runTool("test_coverage", { dry_run: true }),
+  r => r.includes("Would run:") && r.includes("c8") && r.includes("npm test")
+);
+
+await assert("test_coverage honors explicit command in dry_run",
+  await runTool("test_coverage", { command: "go test ./... -cover", dry_run: true }),
+  r => r.includes("go test ./... -cover")
+);
+
+// Fixture with fake secrets — created, scanned, then removed.
+const secretDir = path.join("tests", "tmp-secscan");
+fs.mkdirSync(secretDir, { recursive: true });
+fs.writeFileSync(path.join(secretDir, "leak.js"), [
+  'const awsKey = "AKIAABCDEFGHIJKLMNOP";',
+  'const apiKey = "sk_live_abcdef123456789";',
+  "-----BEGIN RSA PRIVATE KEY-----",
+].join("\n"));
+
+await assert("security_scan finds planted secrets and hides values",
+  await runTool("security_scan", { scope: "secrets", path: secretDir }),
+  r => r.includes("AWS access key") && r.includes("Private key block") &&
+       r.includes("leak.js") && !r.includes("AKIAABCDEFGHIJKLMNOP")
+);
+
+await assert("security_scan is clean on the src tree",
+  await runTool("security_scan", { scope: "secrets", path: "src" }),
+  r => r.includes("0 finding(s)")
+);
+
+fs.rmSync(secretDir, { recursive: true, force: true });
+
+// ── Test 10: LSP client ────────────────────────────────────────────
+console.log("\nTest 10: LSP client");
+
+const { encodeMessage, createMessageParser, languageFor } = await import("../src/integrations/lsp.mjs");
+
+await assert("JSON-RPC framing round-trips across chunk boundaries", (() => {
+  const received = [];
+  const parser = createMessageParser((m) => received.push(m));
+  const wire = Buffer.from(
+    encodeMessage({ jsonrpc: "2.0", id: 1, method: "initialize" }) +
+    encodeMessage({ jsonrpc: "2.0", id: 2, result: { ok: true, text: "héllo wörld" } }),
+    "utf8"
+  );
+  parser(wire.subarray(0, 10));
+  parser(wire.subarray(10, 27));
+  parser(wire.subarray(27));
+  return received;
+})(), r => r.length === 2 && r[0].method === "initialize" && r[1].result.text === "héllo wörld");
+
+await assert("language detection maps extensions to servers",
+  [languageFor("a.ts")?.id, languageFor("b.py")?.id, languageFor("c.rs")?.id, languageFor("d.go")?.id, languageFor("e.txt")],
+  r => r[0] === "typescript" && r[1] === "python" && r[2] === "rust" && r[3] === "go" && r[4] === null
+);
+
+process.env.NIMAGENT_LSP_TYPESCRIPT = "definitely-not-a-real-lsp-binary --stdio";
+await assert("missing server fails gracefully with an install hint",
+  await resultOf(() => runTool("lsp", { action: "symbols", path: "src/ui.mjs" })),
+  r => String(r).startsWith("ERROR:") && String(r).includes("Install it with")
+);
+delete process.env.NIMAGENT_LSP_TYPESCRIPT;
+
+await assert("unsupported extension is rejected with the supported list",
+  await resultOf(() => runTool("lsp", { action: "symbols", path: "README.md" })),
+  r => String(r).startsWith("ERROR:") && String(r).includes("supported:")
+);
+
 // ── Summary ───────────────────────────────────────────────────────
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

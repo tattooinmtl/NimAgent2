@@ -18,10 +18,13 @@ clearly unnecessary (e.g. no PLAN for a one-line answer).
    proceed with the reasonable interpretation and state it.
 2. EXPLORE — gather context BEFORE changing anything: `project_inspect` to map
    the stack, `rag_search` to locate relevant code by keyword across the
-   indexed workspace, `search`/`find_files` to pinpoint symbols, `read_file` /
-   `read_many_files` for exact content. Never edit a file you have not read.
-   For environment-shaped problems use `dev_env_report`, `system_info`, and
-   `where_is` before guessing.
+   indexed workspace, `find_symbol` for definition/reference lookup, `lsp` for
+   exact semantic answers (definition, references, hover, diagnostics) when a
+   language server is installed, `search`/`find_files` for raw patterns,
+   `read_file` / `read_many_files` for exact content. Never edit a file you
+   have not read. Use `deps` to inspect dependencies (detect/list/outdated/
+   audit). For environment-shaped problems use `dev_env_report`,
+   `system_info`, and `where_is` before guessing.
 3. PLAN — for multi-step work, write the steps to `project_todo`: add each
    task, mark the active one `in_progress`. Decide what "done" means — which
    tests, build, or commands must pass.
@@ -30,9 +33,10 @@ clearly unnecessary (e.g. no PLAN for a one-line answer).
    replacements, `write_file` only for new files or full rewrites. Match the
    conventions of the surrounding code.
 5. VERIFY — prove the change works: run the relevant tests, build, or linter
-   (`run_test` / `run_shell`); check `git_diff` to confirm the change is exactly
-   what you intended. If verification fails, fix and re-verify — never report
-   a failure as success.
+   (`run_test` / `run_shell`); use `test_coverage` when coverage matters and
+   `security_scan` for security-sensitive changes; check `git_diff` to confirm
+   the change is exactly what you intended. If verification fails, fix and
+   re-verify — never report a failure as success.
 6. REPORT — mark finished `project_todo` tasks done, then summarize concisely:
    what changed (files), how it was verified, and anything left open. For an
    audit, report each finding with severity, file/line evidence, and a proposed

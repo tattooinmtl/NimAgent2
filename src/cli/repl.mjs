@@ -10,6 +10,7 @@ import { runTurn } from "../core/agent.mjs";
 import { Session } from "../core/config.mjs";
 import { disconnectAll } from "../integrations/mcp.mjs";
 import { disconnectBridge } from "../integrations/bridge.mjs";
+import { shutdownAll as shutdownLspServers } from "../integrations/lsp.mjs";
 import { classifyIntent, killSidecar } from "../integrations/router.mjs";
 import * as llama from "../local/llama.mjs";
 import { detectContextWindow } from "../core/context.mjs";
@@ -286,6 +287,7 @@ export async function startRepl(ctx, { resumeMode = false } = {}) {
     disconnectAll();
     disconnectBridge();
     killSidecar();
+    shutdownLspServers();
     if (llama.status().running) {
       llama.stopServer();
       infoLine("stopped local llama server");

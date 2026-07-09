@@ -11,6 +11,7 @@ import { pathToFileURL } from "node:url";
 import { rgPath, fdPath, jqPath, INSTALL_ROOT } from "../paths.mjs";
 import { HOME } from "../core/config.mjs";
 import { buildIndex as ragBuild, searchIndex as ragSearch } from "../integrations/rag.mjs";
+import { lspRequest } from "../integrations/lsp.mjs";
 
 const MAX_OUTPUT = 30000;
 const PROCESS_LOG_LIMIT = 20000;
@@ -123,6 +124,43 @@ const DEPS_COMMANDS = {
   bundler:  { list: "bundle list", outdated: "bundle outdated", audit: "bundle audit check" },
   dotnet:   { list: "dotnet list package", outdated: "dotnet list package --outdated", audit: "dotnet list package --vulnerable" },
 };
+
+// Pick the coverage runner that matches the project's stack (test_coverage).
+function coverageCommand() {
+  const cwd = process.cwd();
+  const has = (f) => fs.existsSync(path.join(cwd, f));
+  if (has("package.json")) {
+    let pkg = {};
+    try { pkg = JSON.parse(fs.readFileSync(path.join(cwd, "package.json"), "utf8")); } catch { /* unparseable */ }
+    const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
+    if (deps.vitest) return "npx vitest run --coverage";
+    if (deps.jest) return "npx jest --coverage --coverageReporters=text-summary";
+    if (deps.nyc) return "npx nyc --reporter=text-summary npm test";
+    return "npx --yes c8 --reporter=text-summary npm test";
+  }
+  if (has("pyproject.toml") || has("requirements.txt") || has("Pipfile")) {
+    return "python -m pytest --cov --cov-report=term-missing:skip-covered";
+  }
+  if (has("go.mod")) return "go test ./... -cover";
+  if (has("Cargo.toml")) return "cargo llvm-cov --summary-only";
+  try {
+    if (fs.readdirSync(cwd).some((f) => f.endsWith(".csproj") || f.endsWith(".sln"))) {
+      return 'dotnet test --collect:"XPlat Code Coverage"';
+    }
+  } catch { /* unreadable cwd */ }
+  return null;
+}
+
+// Secret-detection rules for security_scan: [label, ripgrep regex].
+// Matches are reported as file:line + rule only; values are never echoed.
+const SECRET_RULES = [
+  ["AWS access key", "\\bAKIA[0-9A-Z]{16}\\b"],
+  ["GitHub token", "\\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}\\b|github_pat_[A-Za-z0-9_]{22,}"],
+  ["Slack token", "\\bxox[baprs]-[A-Za-z0-9-]{10,}\\b"],
+  ["OpenAI-style key", "\\bsk-[A-Za-z0-9_-]{32,}\\b"],
+  ["Private key block", "-----BEGIN [A-Z ]*PRIVATE KEY-----"],
+  ["Hardcoded credential", "(?i)(?:api[_-]?key|secret|token|password|passwd)[\"']?\\s*[:=]\\s*[\"'][^\"'\\s]{8,}[\"']"],
+];
 
 function detectPackageManagers() {
   const has = (f) => fs.existsSync(path.join(process.cwd(), f));
@@ -582,6 +620,55 @@ export const tools = [
   {
     type: "function",
     function: {
+      name: "lsp",
+      description:
+        "Semantic code intelligence via a Language Server (TypeScript/JS, Python, Rust, Go, C#). Actions: definition (jump to where the symbol under a position is defined), references (all usages), hover (type/signature/docs), symbols (file outline), diagnostics (server-reported errors/warnings). Positions are 1-based. Requires the language server to be installed; the error message says how if it isn't. Prefer this over find_symbol when exact semantic answers matter.",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["definition", "references", "hover", "symbols", "diagnostics"] },
+          path: { type: "string", description: "File to query" },
+          line: { type: "integer", description: "1-based line (required for definition/references/hover)" },
+          character: { type: "integer", description: "1-based column, default 1" },
+        },
+        required: ["action", "path"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "test_coverage",
+      description:
+        "Run the project's tests WITH coverage, auto-picking the right runner (vitest/jest/c8/nyc for Node, pytest --cov for Python, go test -cover, cargo llvm-cov, dotnet). Use dry_run=true to see the command without executing. Pass command to override.",
+      parameters: {
+        type: "object",
+        properties: {
+          command: { type: "string", description: "Explicit coverage command; omit to auto-detect" },
+          timeout_ms: { type: "integer", description: "Timeout, default 300000" },
+          dry_run: { type: "boolean", description: "Only report which command would run" },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "security_scan",
+      description:
+        "Security sweep of the workspace: (secrets) pattern-scan for hardcoded credentials, API keys, tokens and private keys — reports file:line and rule only, never the value — plus .env hygiene; (deps) run the package manager's vulnerability audit. scope=all runs both.",
+      parameters: {
+        type: "object",
+        properties: {
+          scope: { type: "string", enum: ["all", "secrets", "deps"], description: "Default all" },
+          path: { type: "string", description: "Directory for the secrets scan, default workspace root" },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "system_info",
       description:
         "Report the user's machine: OS version, CPU, RAM, GPU, disks, hostname, Node version, shell, cwd. Use when diagnosing environment-dependent problems.",
@@ -917,6 +1004,67 @@ export const impl = {
 
   run_test({ command = "npm test", timeout_ms = 120000, allow_unsafe = false, dry_run = false }) {
     return runShellCommand({ command, timeout_ms, allow_unsafe, dry_run });
+  },
+
+  async lsp({ action, path: p, line, character }) {
+    return clip(await lspRequest({ action, path: p, line, character }));
+  },
+
+  test_coverage({ command, timeout_ms = 300000, dry_run = false }) {
+    const cmd = command || coverageCommand();
+    if (!cmd) return "(could not detect a test stack — pass an explicit coverage command)";
+    if (dry_run) return `Would run: ${cmd}\ncwd: ${process.cwd()}`;
+    return `$ ${cmd}\n` + runShellCommand({ command: cmd, timeout_ms });
+  },
+
+  security_scan({ scope = "all", path: p = "." }) {
+    const sections = [];
+
+    if (scope === "all" || scope === "secrets") {
+      const findings = [];
+      for (const [rule, pattern] of SECRET_RULES) {
+        const args = [
+          "--line-number", "--no-heading", "--color", "never", "--max-count", "20",
+          "--glob", "!*.example*", "--glob", "!*.sample*", "--glob", "!*lock*",
+          "-e", pattern, resolve(p),
+        ];
+        const r = spawnSync(rgPath(), args, { encoding: "utf8", maxBuffer: 1024 * 1024 * 16 });
+        if (r.status !== 0 || !r.stdout) continue;
+        for (const line of r.stdout.trim().split("\n")) {
+          const m = line.match(/^(.*?):(\d+):(.*)$/);
+          if (!m) continue;
+          // Skip obvious placeholders to keep the report actionable.
+          if (/not-needed|changeme|placeholder|example|your[-_]|<[^>]+>|xxxx/i.test(m[3])) continue;
+          const rel = path.relative(process.cwd(), m[1]) || m[1];
+          findings.push(`  [${rule}] ${rel}:${m[2]}`);
+        }
+      }
+      const hygiene = [];
+      if (fs.existsSync(path.join(process.cwd(), ".env"))) {
+        let ignored = false;
+        try { ignored = /^\s*\.?\/?\.env\b/m.test(fs.readFileSync(path.join(process.cwd(), ".gitignore"), "utf8")); } catch { /* no .gitignore */ }
+        if (!ignored) hygiene.push("  .env exists but is not listed in .gitignore — real keys may get committed");
+      }
+      sections.push(
+        `Secrets scan — ${findings.length} finding(s)${findings.length ? ":\n" + findings.join("\n") + "\n  (matched values are never printed — open each file:line to review)" : " (clean)"}` +
+        (hygiene.length ? "\nHygiene:\n" + hygiene.join("\n") : "")
+      );
+    }
+
+    if (scope === "all" || scope === "deps") {
+      const managers = detectPackageManagers();
+      if (!managers.length) {
+        sections.push("Dependency audit: no package manager detected");
+      } else {
+        for (const mgr of managers) {
+          const cmd = DEPS_COMMANDS[mgr]?.audit;
+          if (!cmd) continue;
+          sections.push(`Dependency audit (${mgr}) — $ ${cmd}\n` + runShellCommand({ command: cmd, timeout_ms: 180000 }));
+        }
+      }
+    }
+
+    return clip(sections.join("\n\n"));
   },
 
   jq_query({ filter, path: p, raw = false }) {

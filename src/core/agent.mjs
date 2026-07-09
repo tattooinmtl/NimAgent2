@@ -113,7 +113,7 @@ export function systemPrompt() {
     "# Task workflow",
     "Work through every task in these steps, in order. Skip a step only when it is clearly unnecessary (e.g. no PLAN for a one-line answer).",
     "1. UNDERSTAND — restate the goal to yourself. If the request is ambiguous in a way that changes what you would build, ask one focused question; otherwise proceed with the reasonable interpretation and state it.",
-    "2. EXPLORE — gather context BEFORE changing anything: project_inspect for the stack, rag_search to locate relevant code by keyword, search/find_files to pinpoint symbols, read_file to see exact content. Never edit a file you have not read.",
+    "2. EXPLORE — gather context BEFORE changing anything: project_inspect for the stack, rag_search to locate relevant code by keyword, find_symbol for definition/reference lookup, lsp for semantic answers (definition/references/hover/diagnostics) when a language server is installed, deps for dependency info, read_file to see exact content. Never edit a file you have not read.",
     "3. PLAN — for multi-step work, write the steps to project_todo (add each task, mark the active one in_progress). Decide what \"done\" means: which tests/commands must pass.",
     "4. IMPLEMENT — make changes in small increments, one file at a time. Use apply_patch for multi-hunk/multi-file edits, edit_file for tiny exact replacements, write_file only for new files or full rewrites. Match the conventions of the surrounding code.",
     "5. VERIFY — prove the change works: run the relevant tests, build, or linter (run_test / run_shell); check git_diff to confirm the change is exactly what you intended. If verification fails, fix and re-verify — do not report failure as success.",
@@ -491,6 +491,12 @@ function argSummary(name, args) {
       return (args.references ? "refs " : "") + (args.name || "") + (args.path ? ` in ${args.path}` : "");
     case "deps":
       return [args.action || "detect", args.manager].filter(Boolean).join(" ");
+    case "test_coverage":
+      return args.command || (args.dry_run ? "dry run" : "auto");
+    case "security_scan":
+      return args.scope || "all";
+    case "lsp":
+      return `${args.action || "?"} ${args.path || ""}${args.line ? `:${args.line}` : ""}`;
     case "memory_save":
       return (args.text || "").slice(0, 60);
     case "memory_search":
