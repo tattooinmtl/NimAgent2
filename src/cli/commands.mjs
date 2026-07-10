@@ -12,7 +12,7 @@ import {
   saveSettings, resolveModel, SETTINGS_PATH, HOME, Session,
 } from "../core/config.mjs";
 import { runTool, tools } from "../tools/index.mjs";
-import { compactMessages, estimateTokens } from "../core/agent.mjs";
+import { compactMessages, estimateTokens, getLastThinking } from "../core/agent.mjs";
 import { detectContextWindow, parseContextSize, formatContextSize } from "../core/context.mjs";
 import { buildIndex, searchIndex, indexStatus, clearIndex } from "../integrations/rag.mjs";
 import { INSTALL_ROOT } from "../integrations/extras.mjs";
@@ -135,6 +135,27 @@ export const COMMANDS = [
     name: "effort", aliases: ["reasoning"], usage: "/effort [off|low|medium|high|xhigh]", category: "Agent",
     summary: "show or set the reasoning effort tier (persisted)",
     handler: (ctx, arg) => setEffortTier(ctx, arg.trim()),
+  },
+  {
+    name: "thinking", aliases: [], usage: "/thinking [on|off|last]", category: "Agent",
+    summary: "show/hide live <think> reasoning inline; 'last' reprints the most recent turn's reasoning",
+    handler: async (ctx, arg) => {
+      const sub = arg.trim().toLowerCase();
+      if (sub === "on" || sub === "off") {
+        ctx.settings.showThinking = sub === "on";
+        await saveSettings(ctx.settings);
+        infoLine(`live reasoning display: ${sub} (saved) — /thinking last reprints a turn's reasoning either way`);
+        return;
+      }
+      if (sub === "last") {
+        const last = getLastThinking();
+        if (!last.trim()) { infoLine("no reasoning captured for the last turn."); return; }
+        infoLine("last turn's reasoning:");
+        console.log(c.dim(last.trim()));
+        return;
+      }
+      infoLine(`live reasoning display is currently ${ctx.settings.showThinking ? "on" : "off"}. usage: /thinking [on|off|last]`);
+    },
   },
   {
     name: "route", aliases: [], usage: "/route [coding|assistant|auto]", category: "Agent",

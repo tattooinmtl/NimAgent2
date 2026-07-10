@@ -8,13 +8,13 @@ import {
 } from "../ui.mjs";
 import { runTurn } from "../core/agent.mjs";
 import { Session } from "../core/config.mjs";
-import { disconnectAll } from "../integrations/mcp.mjs";
+import { disconnectAll, setMcpConfirm } from "../integrations/mcp.mjs";
 import { disconnectBridge } from "../integrations/bridge.mjs";
 import { shutdownAll as shutdownLspServers } from "../integrations/lsp.mjs";
 import { classifyIntent, killSidecar } from "../integrations/router.mjs";
 import * as llama from "../local/llama.mjs";
 import { detectContextWindow } from "../core/context.mjs";
-import { applySkill, restoreSessionMessages, reportMissingKey } from "./helpers.mjs";
+import { applySkill, restoreSessionMessages, reportMissingKey, reportInsecureEndpoint } from "./helpers.mjs";
 import { activeModelBlockedByHealth } from "./models.mjs";
 import { dispatchCommand, commandNames, commandMenu } from "./commands.mjs";
 import { nextGoalStep } from "./goal.mjs";
@@ -22,8 +22,13 @@ import { nextGoalStep } from "./goal.mjs";
 export async function startRepl(ctx, { resumeMode = false } = {}) {
   banner(ctx.model.key);
   if (ctx.loadedExtensions.length || ctx.skills.length || ctx.mcpInfo.servers) {
+    const mcpNames = ctx.mcpInfo.names || [];
+    const untrustedSet = new Set(ctx.mcpInfo.untrusted || []);
+    const mcpList = mcpNames.length
+      ? ` (${mcpNames.map((n) => (untrustedSet.has(n) ? `${n} [project, untrusted]` : n)).join(", ")})`
+      : "";
     infoLine(
-      `loaded ${ctx.loadedExtensions.length} extension(s), ${ctx.skills.length} skill(s), ${ctx.mcpInfo.servers} MCP server(s)` +
+      `loaded ${ctx.loadedExtensions.length} extension(s), ${ctx.skills.length} skill(s), ${ctx.mcpInfo.servers} MCP server(s)${mcpList}` +
         (ctx.skills.length ? " — " + ctx.skills.map((s) => s.command).join(" ") : "")
     );
     console.log("");
@@ -31,6 +36,7 @@ export async function startRepl(ctx, { resumeMode = false } = {}) {
 
   // First-run onboarding: guide the user to configure a key if none is set.
   if (reportMissingKey(ctx.model)) console.log("");
+  reportInsecureEndpoint(ctx.model);
 
   // Refresh the model's context window from provider metadata in the
   // background; the sync ladder value (user/table) is already in place.
@@ -97,6 +103,18 @@ export async function startRepl(ctx, { resumeMode = false } = {}) {
     startInterruptWatch();
     return answer;
   };
+
+  // Let mcp.mjs ask before ever connecting to a server sourced from this
+  // project's .mcp.json (see loadMcpConfig) — reuses the same y/N/a prompt.
+  // Trust is cached per-project per-definition (mcp.mjs), so this fires once
+  // per server per machine, not on every connect.
+  setMcpConfirm(async (name, target) => {
+    const answer = await ctx.confirmToolUse(
+      `mcp:${name}`,
+      `NEW MCP server from this project's .mcp.json, not your own config — ${target}`
+    );
+    return /^(y|yes|a|always)$/i.test(String(answer || "").trim());
+  });
 
   function clearPendingInput() {
     if (typeof rl.line === "string") rl.line = "";
@@ -176,7 +194,13 @@ export async function startRepl(ctx, { resumeMode = false } = {}) {
     setImmediate(renderMenu);
   });
 
+  // Set on rl "close"; a line handler that was still awaiting a turn when the
+  // REPL closed (burst/piped input) must not touch the closed readline —
+  // rl.prompt() after close throws ERR_USE_AFTER_CLOSE and kills the process.
+  let replClosed = false;
+
   function showPrompt() {
+    if (replClosed) return;
     clearPendingInput();
     statusBar(ctx.model, ctx.session);
     promptTop();
@@ -186,7 +210,7 @@ export async function startRepl(ctx, { resumeMode = false } = {}) {
 
   // Run one agent turn, then keep going while goal mode queues continuations.
   async function runAgentTurns() {
-    rl.pause();
+    if (!replClosed) rl.pause();
     startInterruptWatch();
     let keepGoing = true;
     while (keepGoing) {
@@ -201,6 +225,7 @@ export async function startRepl(ctx, { resumeMode = false } = {}) {
         signal: ctx.currentAbort.signal,
         permissions: ctx.settings.permissions,
         confirmTool: ctx.confirmToolUse,
+        showThinking: ctx.settings.showThinking,
       });
       const aborted = ctx.currentAbort.signal.aborted;
       ctx.currentAbort = null;
@@ -222,7 +247,9 @@ export async function startRepl(ctx, { resumeMode = false } = {}) {
     stopInterruptWatch();
     console.log("");
     clearPendingInput();
-    rl.resume();
+    // The REPL may have closed while the turn ran (stdin EOF, /exit) —
+    // resuming a closed readline throws ERR_USE_AFTER_CLOSE.
+    if (!replClosed) rl.resume();
   }
 
   let multiLine = "";
@@ -284,6 +311,7 @@ export async function startRepl(ctx, { resumeMode = false } = {}) {
   });
 
   rl.on("close", async () => {
+    replClosed = true;
     disconnectAll();
     disconnectBridge();
     killSidecar();

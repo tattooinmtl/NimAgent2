@@ -16,7 +16,7 @@ import {
 import { registerMcpProxy } from "../integrations/mcp.mjs";
 import { registerNimToolsProxy } from "../integrations/bridge.mjs";
 import { classifyIntent, warmSidecar } from "../integrations/router.mjs";
-import { applySkill, reportMissingKey, maskKey } from "./helpers.mjs";
+import { applySkill, reportMissingKey, reportInsecureEndpoint, maskKey } from "./helpers.mjs";
 import { activeModelBlockedByHealth } from "./models.mjs";
 import { registerGoalTool } from "./goal.mjs";
 import { startRepl } from "./repl.mjs";
@@ -155,6 +155,7 @@ export async function main(args) {
       await shutdown(1);
       return;
     }
+    reportInsecureEndpoint(ctx.model);
     const firstWord = promptArg.split(/\s+/)[0];
     const skill = skillByCommand.get(firstWord);
     if (skill) {
@@ -179,6 +180,7 @@ export async function main(args) {
       persona: ctx.activePersona,
       signal: ctx.currentAbort.signal,
       permissions: settings.permissions,
+      showThinking: settings.showThinking,
     });
     ctx.currentAbort = null;
     costLine(session);

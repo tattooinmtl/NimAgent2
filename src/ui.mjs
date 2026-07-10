@@ -164,6 +164,7 @@ const THINKING_FRAMES = [
 // color: one of the `c.*` helpers (respects NO_COLOR / non-TTY).
 const STATES = {
   thinking:  { color: c.magenta, frames: THINKING_FRAMES },
+  reasoning: { color: c.gray,    frames: ["▸ Reasoning", "▸ Reasoning.", "▸ Reasoning..", "▸ Reasoning..."] },
   searching: { color: c.cyan,    frames: ["⌕ Searching", "⌕ Searching.", "⌕ Searching..", "⌕ Searching..."] },
   coding:    { color: c.green,   frames: ["</> Writing code", "</> Writing code.", "</> Writing code..", "</> Writing code..."] },
   reading:   { color: c.blue,    frames: ["▤ Reading files", "▥ Reading files.", "▦ Reading files..", "▦ Reading files..."] },

@@ -64,6 +64,24 @@ export function reportMissingKey(model) {
   return true;
 }
 
+// Plaintext http:// to a non-loopback host means the request AND the model's
+// response travel unencrypted — an on-path attacker can't just read prompts,
+// they can rewrite the response, which directly drives tool execution. Doesn't
+// block the provider (some setups genuinely run this way), just makes the risk
+// visible instead of silent.
+export function reportInsecureEndpoint(model) {
+  let url;
+  try {
+    url = new URL(model.provider.baseUrl);
+  } catch {
+    return false;
+  }
+  const isLoopback = ["localhost", "127.0.0.1", "::1"].includes(url.hostname);
+  if (url.protocol !== "http:" || isLoopback) return false;
+  warnLine(`Provider "${model.providerName}" uses plaintext http:// to ${url.hostname} — requests and model responses are unencrypted and can be tampered with in transit.`);
+  return true;
+}
+
 // Parse "100k" / "1.5m" / "250000" into a token count (null if unparseable).
 export function parseTokenBudget(text) {
   const m = String(text || "").trim().match(/^(\d+(?:\.\d+)?)([km])?$/i);

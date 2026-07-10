@@ -27,11 +27,41 @@ function workspaceRoot() {
   return path.resolve(process.cwd());
 }
 
+// Lexical containment first — cheap, and catches the common ".." escape.
+// Then symlink-aware containment: path.relative doesn't follow links, so a
+// symlink INSIDE cwd pointing OUTSIDE it would pass the lexical check and let
+// read/write escape the workspace undetected. Realpath the nearest existing
+// ancestor (the target may not exist yet — e.g. a new file being created) and
+// reattach the not-yet-existing suffix before re-checking containment.
 function assertInsideWorkspace(full, label = "path") {
   const root = workspaceRoot();
   const rel = path.relative(root, full);
-  if (rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel))) return full;
-  throw new Error(`${label} escapes workspace: ${path.relative(root, full) || full}`);
+  if (rel !== "" && (rel.startsWith("..") || path.isAbsolute(rel))) {
+    throw new Error(`${label} escapes workspace: ${path.relative(root, full) || full}`);
+  }
+
+  const realRoot = fs.realpathSync(root);
+  let dir = full;
+  let suffix = "";
+  let realDir;
+  for (;;) {
+    try {
+      realDir = fs.realpathSync(dir);
+      break;
+    } catch (e) {
+      if (e.code !== "ENOENT") throw e;
+      const parent = path.dirname(dir);
+      if (parent === dir) throw e; // reached filesystem root without finding anything real
+      suffix = suffix ? path.join(path.basename(dir), suffix) : path.basename(dir);
+      dir = parent;
+    }
+  }
+  const realFull = suffix ? path.join(realDir, suffix) : realDir;
+  const realRel = path.relative(realRoot, realFull);
+  if (realRel !== "" && (realRel.startsWith("..") || path.isAbsolute(realRel))) {
+    throw new Error(`${label} escapes workspace via a symlink: ${path.relative(root, full) || full}`);
+  }
+  return full;
 }
 
 function resolve(p = ".") {
@@ -42,25 +72,40 @@ function resolveForCreate(p) {
   return assertInsideWorkspace(path.resolve(process.cwd(), p));
 }
 
-function commandRisk(command) {
+// Each entry maps a pattern to a short, specific reason (shown to the human
+// in the confirm prompt — see checkCommandRisk in agent.mjs) instead of one
+// generic "destructive" label, so a registry edit reads differently than a
+// recursive delete.
+const BLOCKED_PATTERNS = [
+  { re: /\brm\s+(-[^\n]*r|--recursive)/, reason: "recursively deletes files — irreversible" },
+  { re: /\bremove-item\b[^\n]*(\s-r|\s-recurse|recursive)/, reason: "recursively deletes files — irreversible" },
+  { re: /\brmdir\b[^\n]*(\/s|-r|--recursive)/, reason: "recursively deletes a directory — irreversible" },
+  { re: /\bdel\b[^\n]*(\/s|\/q)/, reason: "force/recursively deletes files — irreversible" },
+  { re: /\bgit\s+(reset\s+--hard|clean\s+-[^\n]*[xfd])/, reason: "discards uncommitted work irreversibly" },
+  { re: /\bformat\b\s+[a-z]:/, reason: "formats a disk volume — irreversible data loss" },
+  { re: /\bshutdown\b/, reason: "shuts down or restarts the computer" },
+  // Windows Registry — autostart entries, security settings, installed-software
+  // config all live here; this is also a classic persistence/tampering target.
+  { re: /\breg(?:\.exe)?\s+(add|import|copy|restore|delete)\b/, reason: "modifies the Windows Registry (autostart/security settings)" },
+  { re: /\bregedit\b[^\n]*\/s\b/, reason: "silently imports a .reg file into the Registry" },
+  { re: /\b(set|new|remove)-itemproperty\b[^\n]*\bhk(lm|cu|cr|u|cc)\b/, reason: "modifies the Windows Registry (autostart/security settings)" },
+  { re: /\b(new|remove)-item\b[^\n]*\bhk(lm|cu|cr|u|cc):/, reason: "modifies the Windows Registry (autostart/security settings)" },
+  // Persistence mechanisms
+  { re: /\bschtasks\b[^\n]*\/create\b/, reason: "creates a scheduled task (persistence)" },
+  { re: /\bsc(?:\.exe)?\s+create\b/, reason: "creates a Windows service (persistence)" },
+  { re: /\bnew-service\b/, reason: "creates a Windows service (persistence)" },
+  // Security posture
+  { re: /\bset-executionpolicy\b/, reason: "changes PowerShell's execution policy" },
+  { re: /\bset-mppreference\b/, reason: "changes Windows Defender/antivirus settings" },
+  { re: /\bnetsh\s+advfirewall/, reason: "modifies Windows Firewall rules" },
+  { re: /\bnew-netfirewallrule\b/, reason: "adds a Windows Firewall rule" },
+  { re: /\bbcdedit\b/, reason: "modifies Windows boot configuration" },
+];
+
+export function commandRisk(command) {
   const c = String(command || "").toLowerCase();
-  const destructive = [
-    /\brm\s+(-[^\n]*r|--recursive)/,
-    /\bremove-item\b[^\n]*(\s-r|\s-recurse|recursive)/,
-    /\brmdir\b[^\n]*(\/s|-r|--recursive)/,
-    /\bdel\b[^\n]*(\/s|\/q)/,
-    /\bgit\s+(reset\s+--hard|clean\s+-[^\n]*[xfd])/,
-    /\bformat\b\s+[a-z]:/,
-    /\bshutdown\b/,
-    /\breg\s+delete\b/,
-    /\bset-executionpolicy\b/,
-  ].some((re) => re.test(c));
-  if (destructive) {
-    return {
-      level: "blocked",
-      reason: "destructive or irreversible command",
-    };
-  }
+  const hit = BLOCKED_PATTERNS.find(({ re }) => re.test(c));
+  if (hit) return { level: "blocked", reason: hit.reason };
   const elevated = [
     /\bnpm\s+(install|i)\b/,
     /\bpnpm\s+(install|add)\b/,
@@ -723,6 +768,39 @@ export const tools = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "create_tool",
+      description:
+        "Create a brand-new tool for yourself, right now — no restart needed. Write the " +
+        "full source of a NimAgent extension module: an ESM file that default-exports " +
+        "{ name, tools: [...OpenAI function-tool schemas], impl: { toolName: fn } }. " +
+        "It's written to extensions/<name>.js, hot-loaded into THIS session immediately " +
+        "(the new tool name(s) are callable on your very next turn), and persisted to " +
+        "nimagent.config.json so it survives restarts. Calling this again with the same " +
+        "`name` replaces the previous version — old tool names from that file are dropped " +
+        "first, so you can iterate on a broken tool without leaving stale duplicates. " +
+        "impl functions receive the parsed args object, may be sync or async, and whatever " +
+        "they return is stringified and sent back to the model as the tool result; a thrown " +
+        "error becomes the error message the model sees. Prefer node: built-ins only (no " +
+        "npm packages available). Scope any filesystem access to the workspace.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: {
+            type: "string",
+            description: "Extension name — alnum/dash/underscore only. File becomes extensions/<name>.js.",
+          },
+          code: {
+            type: "string",
+            description: "Full ESM module source implementing the { name, tools, impl } contract.",
+          },
+        },
+        required: ["name", "code"],
+      },
+    },
+  },
 ];
 
 export const impl = {
@@ -1107,16 +1185,39 @@ export const impl = {
 
   git_commit({ message, paths = [], all = false }) {
     if (!message || !String(message).trim()) throw new Error("commit message is required");
+
+    let candidates;
     if (all) {
       runGit(["add", "-A"]);
+      candidates = runGit(["diff", "--staged", "--name-only"]).split("\n").map((s) => s.trim()).filter(Boolean);
     } else {
       const selected = Array.isArray(paths) ? paths : [];
       if (!selected.length) throw new Error("provide paths or set all=true");
       for (const p of selected) resolve(p);
       runGit(["add", "--", ...selected]);
+      candidates = selected;
     }
+
+    // Secret-looking filenames that aren't gitignored get unstaged before the
+    // commit happens — a live key belongs in .gitignore, not in git history
+    // forever, and git history is effectively permanent. See security audit L3.
+    const risky = candidates.filter((p) => looksLikeSecretFile(p) && !isGitIgnored(p));
+    if (risky.length) runGit(["reset", "--", ...risky]);
+
+    const stagedNow = runGit(["diff", "--staged", "--name-only"]).trim();
+    if (!stagedNow) {
+      throw new Error(
+        risky.length
+          ? `nothing to commit — the only staged change(s) looked like secret file(s) and were unstaged: ${risky.join(", ")}`
+          : "nothing to commit — no changes staged"
+      );
+    }
+
     const out = runGit(["commit", "-m", String(message)]);
-    return clip(out);
+    const warning = risky.length
+      ? `\n\n⚠ Skipped staging ${risky.length} secret-looking file(s), not committed: ${risky.join(", ")} — add to .gitignore, or stage explicitly if this is a false positive.`
+      : "";
+    return clip(out) + warning;
   },
 
   project_todo(args) {
@@ -1199,6 +1300,10 @@ ${content}`;
     fs.mkdirSync(path.dirname(full), { recursive: true });
     fs.writeFileSync(full, markdown, 'utf8');
     return `Created markdown report ${filename} with title "${title}"`;
+  },
+
+  create_tool({ name, code }) {
+    return createTool(name, code);
   },
 };
 
@@ -1305,6 +1410,33 @@ function applyPatchText(patch) {
     }
   }
   return changed.length ? `Patch applied: ${changed.join(", ")}` : "Patch had no changes";
+}
+
+// Filenames that almost always mean "secret material" if committed.
+// Deliberately conservative — a false skip just means re-staging it
+// explicitly after reading why; a false negative means a live secret
+// preserved in git history forever.
+const SECRET_FILE_PATTERNS = [
+  /^\.env(\..+)?$/i,
+  /\.pem$/i,
+  /\.key$/i,
+  /\.pfx$/i,
+  /\.p12$/i,
+  /^id_(rsa|dsa|ecdsa|ed25519)$/i,
+  /^credentials\.json$/i,
+  /^service[-_]?account.*\.json$/i,
+];
+const SECRET_FILE_ALLOWLIST_RE = /\.(example|sample|template)$/i;
+
+function looksLikeSecretFile(relPath) {
+  const base = path.basename(String(relPath || ""));
+  if (SECRET_FILE_ALLOWLIST_RE.test(base)) return false;
+  return SECRET_FILE_PATTERNS.some((re) => re.test(base));
+}
+
+function isGitIgnored(relPath) {
+  const r = spawnSync("git", ["check-ignore", "-q", "--", relPath], { cwd: process.cwd() });
+  return r.status === 0;
 }
 
 function runGit(args) {
@@ -1816,25 +1948,104 @@ function globToRegex(g) {
   return new RegExp(`^${s}$`, "i");
 }
 
+// Which tool names each extension file (relative path) most recently
+// registered — lets a hot reload drop stale entries before re-adding.
+const extensionToolNames = new Map();
+
+function unregisterExtensionTools(rel) {
+  const prev = extensionToolNames.get(rel);
+  if (!prev) return;
+  for (const name of prev) {
+    const idx = tools.findIndex((t) => t.function?.name === name);
+    if (idx !== -1) tools.splice(idx, 1);
+    delete impl[name];
+  }
+  extensionToolNames.delete(rel);
+}
+
+// Import one extension file and merge its tools + impls into the live
+// registry. Cache-busted so re-importing the same path (hot reload) picks up
+// new file contents instead of Node's ESM module cache.
+async function loadExtensionFile(root, rel) {
+  unregisterExtensionTools(rel);
+  const url = pathToFileURL(path.join(root, rel)).href + `?t=${Date.now()}`;
+  const mod = await import(url);
+  const ext = mod.default || mod;
+  const names = [];
+  if (Array.isArray(ext.tools)) {
+    for (const t of ext.tools) {
+      tools.push(t);
+      if (t.function?.name) names.push(t.function.name);
+    }
+  }
+  if (ext.impl && typeof ext.impl === "object") {
+    Object.assign(impl, ext.impl);
+  }
+  extensionToolNames.set(rel, names);
+  return ext.name || rel;
+}
+
 // Load extension modules and merge their tools + impls into the registry.
 // Each extension default-exports { name, tools: [...], impl: { name: fn } }.
 export async function registerExtensions(root, files = []) {
   const loaded = [];
   for (const rel of files) {
     try {
-      const url = pathToFileURL(path.join(root, rel)).href;
-      const mod = await import(url);
-      const ext = mod.default || mod;
-      if (Array.isArray(ext.tools)) {
-        for (const t of ext.tools) tools.push(t);
-      }
-      if (ext.impl && typeof ext.impl === "object") {
-        Object.assign(impl, ext.impl);
-      }
-      loaded.push(ext.name || rel);
+      loaded.push(await loadExtensionFile(root, rel));
     } catch (e) {
       loaded.push(`${rel} (failed: ${e.message})`);
     }
   }
   return loaded;
+}
+
+function nimAgentConfigPath() {
+  return path.join(INSTALL_ROOT, "nimagent.config.json");
+}
+
+// Read-modify-write nimagent.config.json's `extensions` array (never clobbers
+// other keys). Mirrors the same pattern used by the package installer.
+function addExtensionToConfig(rel) {
+  let cfg = {};
+  try {
+    cfg = JSON.parse(fs.readFileSync(nimAgentConfigPath(), "utf8"));
+  } catch {
+    /* start fresh if missing/unparseable */
+  }
+  const extensions = [...new Set([...(cfg.extensions || []), rel])];
+  fs.writeFileSync(nimAgentConfigPath(), JSON.stringify({ ...cfg, extensions }, null, 2) + "\n", "utf8");
+}
+
+// Backing implementation for the create_tool tool: write an extension's
+// source, hot-load it into this session, and persist it so it survives
+// restarts. See the create_tool tool schema above for the module contract.
+async function createTool(name, code) {
+  if (!name || !/^[a-zA-Z0-9_-]+$/.test(name)) {
+    throw new Error("name must be alnum/dash/underscore only (used as extensions/<name>.js)");
+  }
+  if (!code || !String(code).trim()) throw new Error("code is required");
+
+  const rel = `extensions/${name}.js`;
+  const full = path.join(INSTALL_ROOT, rel);
+  fs.mkdirSync(path.dirname(full), { recursive: true });
+  fs.writeFileSync(full, code, "utf8");
+
+  let registeredName;
+  try {
+    registeredName = await loadExtensionFile(INSTALL_ROOT, rel);
+  } catch (e) {
+    throw new Error(`wrote ${rel} but it failed to load: ${e.message}`);
+  }
+
+  const toolNames = extensionToolNames.get(rel) || [];
+  if (!toolNames.length) {
+    throw new Error(`${rel} loaded but exported no tools — check the module's default export`);
+  }
+
+  addExtensionToConfig(rel);
+
+  return (
+    `Created and loaded extension "${registeredName}" (${rel}) — new tool(s) available now: ` +
+    `${toolNames.join(", ")}. Persisted to nimagent.config.json so it survives restarts.`
+  );
 }

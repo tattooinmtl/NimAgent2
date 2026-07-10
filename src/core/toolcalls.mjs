@@ -45,9 +45,90 @@ export function hasToolIntent(content) {
   return /<tool_call|<function\s*=|<arg_key>|<parameter\s*=|<invoke\b/i.test(String(content || ""));
 }
 
-// Remove closed <think>…</think> reasoning blocks (GLM/Qwen reasoning leak).
+// Remove <think>…</think> reasoning blocks (GLM/Qwen reasoning leak). An
+// unclosed trailing block (response truncated mid-reasoning) is dropped too,
+// rather than leaking the raw tag into the stored conversation history.
 export function stripThink(content) {
-  return String(content || "").replace(/<think>[\s\S]*?<\/think>/g, "");
+  const rest = String(content || "").replace(/<think>[\s\S]*?<\/think>/g, "");
+  const openIdx = rest.indexOf("<think>");
+  return openIdx !== -1 ? rest.slice(0, openIdx) : rest;
+}
+
+// Like stripThink, but also returns the captured reasoning text — for the
+// non-streaming paths (a full response arrived with no live onToken), used to
+// report/display <think> content after the fact instead of just discarding it.
+export function extractThink(content) {
+  let think = "";
+  let rest = String(content || "").replace(/<think>([\s\S]*?)<\/think>/g, (_, inner) => {
+    think += inner;
+    return "";
+  });
+  // Unclosed trailing <think> (response truncated mid-reasoning) — treat
+  // everything from the tag onward as reasoning, same as the live splitter's
+  // flush() behavior, instead of leaking the raw tag into the visible answer.
+  const openIdx = rest.indexOf("<think>");
+  if (openIdx !== -1) {
+    think += rest.slice(openIdx + "<think>".length);
+    rest = rest.slice(0, openIdx);
+  }
+  return { think, rest };
+}
+
+// Incrementally splits a live token stream into "think" and "answer" segments
+// so <think>…</think> reasoning (GLM/Qwen) can be rendered differently instead
+// of leaking raw tags into the terminal. Tolerant of a tag being split across
+// chunk boundaries: holds back a short tail (shorter than the longer tag)
+// until enough text has arrived to know it isn't the start of a tag.
+// Usage: const s = createThinkSplitter(); const {think, answer} = s.feed(tok);
+// … at stream end: const {think, answer} = s.flush();
+export function createThinkSplitter() {
+  let buf = "";
+  let inThink = false;
+
+  function scan() {
+    let think = "";
+    let answer = "";
+    for (;;) {
+      if (!inThink) {
+        const open = buf.indexOf("<think>");
+        if (open === -1) {
+          const safe = Math.max(0, buf.length - "<think>".length + 1);
+          answer += buf.slice(0, safe);
+          buf = buf.slice(safe);
+          break;
+        }
+        answer += buf.slice(0, open);
+        buf = buf.slice(open + "<think>".length);
+        inThink = true;
+      } else {
+        const close = buf.indexOf("</think>");
+        if (close === -1) {
+          const safe = Math.max(0, buf.length - "</think>".length + 1);
+          think += buf.slice(0, safe);
+          buf = buf.slice(safe);
+          break;
+        }
+        think += buf.slice(0, close);
+        buf = buf.slice(close + "</think>".length);
+        inThink = false;
+      }
+    }
+    return { think, answer };
+  }
+
+  return {
+    feed(token) {
+      buf += String(token || "");
+      return scan();
+    },
+    // Call once after the stream ends to release any text held back for
+    // tag-boundary safety (or an unclosed trailing <think> block).
+    flush() {
+      const out = inThink ? { think: buf, answer: "" } : { think: "", answer: buf };
+      buf = "";
+      return out;
+    },
+  };
 }
 
 // Remove all tool-call syntax from content meant for display / history.

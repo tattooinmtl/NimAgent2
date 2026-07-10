@@ -3,16 +3,92 @@
 
 import { chatStream, completionStream } from "./provider.mjs";
 import { renderTemplate } from "../integrations/router.mjs";
-import { tools, runTool } from "../tools/index.mjs";
+import { tools, runTool, commandRisk } from "../tools/index.mjs";
 import {
   parseTextToolCalls, buildParamRegistry, hasToolIntent,
   stripThink, stripToolCallText, textToolInstructions, recoveryMessage,
+  createThinkSplitter, extractThink,
 } from "./toolcalls.mjs";
 import {
   c, assistantPrefix, toolLine, toolResultLine, errorLine, warnLine,
   startStatus, stopStatus, startGenerationStatus, diffPreviewLine,
   streamWrite, streamNewline
 } from "../ui.mjs";
+
+// Most recent turn's full <think>…</think> reasoning text, regardless of
+// whether it was shown live or collapsed. Read by the /thinking last command.
+let lastThinking = "";
+export function getLastThinking() {
+  return lastThinking;
+}
+
+// Routes live provider tokens into "think" vs "answer" streams and renders
+// each appropriately. Reasoning is collapsed by default (spinner + one-line
+// summary once it ends); showThinking=true streams it inline, dimmed.
+// Created fresh per streaming attempt so state never leaks across retries.
+function createTurnStreamRouter(showThinking) {
+  const splitter = createThinkSplitter();
+  let thinkStarted = false;
+  let answerStarted = false;
+  let thinkReported = false;
+  let fullThink = "";
+
+  // Closes out the reasoning section: dimmed live mode just needs a blank
+  // line; collapsed mode needs the one-line summary printed exactly once —
+  // whether that's triggered by the answer starting or, for a pure-reasoning
+  // turn with no answer at all, by finish().
+  function reportThinkEnd() {
+    if (thinkReported) return;
+    thinkReported = true;
+    if (showThinking) {
+      process.stdout.write("\n\n");
+    } else {
+      const words = fullThink.trim().split(/\s+/).filter(Boolean).length;
+      console.log(`  ${c.dim(`▸ Thinking (~${words} words) — /thinking last to view`)}`);
+    }
+  }
+
+  function routeThink(text) {
+    if (!text) return;
+    fullThink += text;
+    if (!thinkStarted) {
+      thinkStarted = true;
+      stopStatus();
+      if (showThinking) console.log(`  ${c.dim("▾ Thinking")}`);
+      else startStatus("reasoning");
+    }
+    if (showThinking) process.stdout.write(c.dim(text));
+  }
+
+  function routeAnswer(text) {
+    if (!text) return;
+    if (!answerStarted) {
+      answerStarted = true;
+      stopStatus();
+      if (thinkStarted) reportThinkEnd();
+      assistantPrefix();
+    }
+    streamWrite(text);
+  }
+
+  return {
+    onToken(token) {
+      const { think, answer } = splitter.feed(token);
+      routeThink(think);
+      routeAnswer(answer);
+    },
+    // Call once after the stream settles (success or error) to release any
+    // buffered tail and report what actually happened this attempt.
+    finish() {
+      const { think, answer } = splitter.flush();
+      routeThink(think);
+      routeAnswer(answer);
+      if (thinkStarted && !thinkReported) { stopStatus(); reportThinkEnd(); }
+      lastThinking = fullThink;
+      return { thinkStarted, answerStarted };
+    },
+  };
+}
 
 // Re-serialize past assistant tool calls in the EXACT format the protocol
 // instructions demand, so the model's own history reinforces the right shape
@@ -233,7 +309,44 @@ async function checkPermission(name, summary, permissions, confirmTool) {
   return { allowed: false, message: `DENIED: the user declined the "${name}" tool call.` };
 }
 
-export async function runTurn({ model, messages, session, maxIterations = 30, diffPreview = true, persona = null, signal = null, permissions = null, confirmTool = null }) {
+// Extra gate for run_shell/start_process commands matching a high-risk pattern
+// (registry edits, persistence, firewall/boot changes, irreversible deletes —
+// see commandRisk in tools/index.mjs). Independent of the tool's configured
+// permission state: even "allow" doesn't skip this, and the model can't
+// self-authorize past it by passing allow_unsafe — only a human answering the
+// confirm prompt can. No confirmTool (non-interactive session) means no human
+// to ask, so it's denied rather than silently allowed.
+async function checkCommandRisk(name, args, confirmTool) {
+  if (name !== "run_shell" && name !== "start_process") return null;
+  const risk = commandRisk(args?.command);
+  if (risk.level !== "blocked") return null;
+  if (!confirmTool) {
+    return { allowed: false, message: `DENIED: this command ${risk.reason}, which requires interactive confirmation, but this session is non-interactive.` };
+  }
+  const answer = String((await confirmTool(name, `⚠ HIGH RISK — ${risk.reason}`)) || "").trim().toLowerCase();
+  if (answer === "y" || answer === "yes" || answer === "a" || answer === "always") {
+    return { allowed: true, approvedUnsafe: true };
+  }
+  return { allowed: false, message: `DENIED: the user declined this high-risk command (${risk.reason}).` };
+}
+
+// Extra gate for create_tool: writing + hot-loading + persisting a new
+// extension is the single most powerful tool in the registry — unlike a
+// one-off shell command, it runs on every future launch until manually
+// removed. Forced independent of the tool's configured permission, same
+// shape as checkCommandRisk above, but unconditional: every call qualifies,
+// there's no "safe" create_tool call the way there's a safe run_shell call.
+async function checkCreateToolRisk(name, confirmTool) {
+  if (name !== "create_tool") return null;
+  if (!confirmTool) {
+    return { allowed: false, message: `DENIED: create_tool installs a persistent extension and requires interactive confirmation, but this session is non-interactive.` };
+  }
+  const answer = String((await confirmTool(name, "installs a NEW extension that runs on every future launch until removed")) || "").trim().toLowerCase();
+  if (answer === "y" || answer === "yes" || answer === "a" || answer === "always") return { allowed: true };
+  return { allowed: false, message: `DENIED: the user declined to install this extension.` };
+}
+
+export async function runTurn({ model, messages, session, maxIterations = 30, diffPreview = true, persona = null, signal = null, permissions = null, confirmTool = null, showThinking = false }) {
   // If a persona is active, swap the system message and iteration budget.
   // Falls back to the defaults above when persona is null (existing behaviour).
   if (persona) {
@@ -271,7 +384,11 @@ export async function runTurn({ model, messages, session, maxIterations = 30, di
 
     let resp;
     let streamedContent = false;
+    let routerResult = { thinkStarted: false, answerStarted: false };
     let tokenCount = 0;
+    // Fresh per attempt: splits live tokens into think/answer streams and
+    // renders each (collapsed reasoning by default; see showThinking above).
+    const router = createTurnStreamRouter(showThinking);
     try {
       // While the model is producing its first token, show the framed token
       // meter (the yellow-bounded bottom panel). As soon as text arrives we
@@ -297,8 +414,7 @@ export async function runTurn({ model, messages, session, maxIterations = 30, di
           _templatePrompt: prompt,
           onToken(token) {
             tokenCount++;
-            if (!streamedContent) { stopStatus(); assistantPrefix(); streamedContent = true; }
-            streamWrite(token);
+            router.onToken(token);
           },
         });
       } else {
@@ -310,19 +426,18 @@ export async function runTurn({ model, messages, session, maxIterations = 30, di
           signal,
           onToken: useTextTools ? undefined : function onToken(token) {
             tokenCount++;
-            if (!streamedContent) {
-              stopStatus();
-              assistantPrefix();
-              streamedContent = true;
-            }
-            streamWrite(token);
+            router.onToken(token);
           },
         });
       }
 
+      routerResult = router.finish();
+      streamedContent = routerResult.answerStarted;
       if (!streamedContent) stopStatus();
       else streamNewline();
     } catch (e) {
+      routerResult = router.finish();
+      streamedContent = routerResult.answerStarted;
       if (!streamedContent) stopStatus();
       else streamNewline();
       if (e.name === "AbortError" || signal?.aborted) {
@@ -336,12 +451,38 @@ export async function runTurn({ model, messages, session, maxIterations = 30, di
 
     const msg = resp.message;
 
+    // Strip <think> blocks from content on EVERY path — both what gets shown
+    // below and what gets stored in history (and therefore re-sent to the
+    // provider). The native-tools path emits think tags in content too.
+    let rawContent = "";
+    if (msg.content) {
+      if (routerResult.thinkStarted || routerResult.answerStarted) {
+        // Already routed live — think content, if any, was already
+        // shown/collapsed and reported by the router above.
+        rawContent = stripThink(msg.content);
+      } else {
+        // No live token stream reached the terminal this attempt (always true
+        // for useTextTools). Extract and report now instead.
+        const extracted = extractThink(msg.content);
+        rawContent = extracted.rest;
+        if (extracted.think) {
+          lastThinking = extracted.think;
+          if (showThinking) {
+            console.log(`  ${c.dim("▾ Thinking")}`);
+            console.log(c.dim(extracted.think.trim()));
+            console.log("");
+          } else {
+            const words = extracted.think.trim().split(/\s+/).filter(Boolean).length;
+            console.log(`  ${c.dim(`▸ Thinking (~${words} words) — /thinking last to view`)}`);
+          }
+        }
+      }
+    }
+
     // Template/text-tool paths: parse tool-call text (canonical XML, GLM
     // arg_key/arg_value, Qwen JSON, hybrid/unclosed forms) into OpenAI
-    // tool_calls, then strip the tool syntax + <think> blocks from content.
-    let rawContent = "";
+    // tool_calls, then strip the tool syntax from content.
     if ((useTemplate || useTextTools) && msg.content) {
-      rawContent = stripThink(msg.content);
       const toolCalls = parseTextToolCalls(rawContent, paramRegistry);
       if (toolCalls.length) {
         msg.tool_calls = toolCalls;
@@ -349,6 +490,8 @@ export async function runTurn({ model, messages, session, maxIterations = 30, di
       } else {
         msg.content = rawContent.trim();
       }
+    } else if (msg.content) {
+      msg.content = rawContent.trim();
     }
 
     messages.push(msg);
@@ -406,6 +549,16 @@ export async function runTurn({ model, messages, session, maxIterations = 30, di
     // confirmations don't interleave on the terminal.
     for (const p of parsed) {
       p.permission = await checkPermission(p.name, argSummary(p.name, p.args), permissions, confirmTool);
+      if (p.permission.allowed) {
+        const riskGate = await checkCommandRisk(p.name, p.args, confirmTool);
+        if (riskGate) {
+          p.permission = riskGate;
+          if (riskGate.approvedUnsafe) p.args.allow_unsafe = true;
+        } else {
+          const createGate = await checkCreateToolRisk(p.name, confirmTool);
+          if (createGate) p.permission = createGate;
+        }
+      }
       if (!p.permission.allowed) warnLine(`${p.name}: ${p.permission.message.split(":")[0].toLowerCase()} by permissions`);
     }
 

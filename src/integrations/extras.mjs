@@ -37,18 +37,27 @@ export function writeProjectConfig(patch) {
 
 // Merge MCP server definitions from nimagent.config.json and a project-local
 // .mcp.json (the vendor-neutral standard). .mcp.json wins on name collisions.
-// Returns { servers: { <name>: def }, settings: {...} }.
+// Returns { servers: { <name>: def }, settings: {...}, untrusted: Set<name> }.
+//
+// `untrusted` names every server sourced from .mcp.json — that file travels
+// with a cloned repo, so it can name a server the repo's author chose, not the
+// person running NimAgent. mcp.mjs requires a one-time human confirmation
+// before ever connecting to one (see setMcpConfirm / the trust-fingerprint
+// cache), so opening an unfamiliar project can't silently spawn a process or
+// call out to an attacker-controlled endpoint using this machine's credentials.
 export function loadMcpConfig(config = loadProjectConfig()) {
   const servers = { ...(config.mcpServers || {}) };
   const settings = { idleTimeout: 10, directTools: false, ...(config.mcp || {}) };
+  const untrusted = new Set();
   try {
     const dotMcp = JSON.parse(fs.readFileSync(path.join(process.cwd(), ".mcp.json"), "utf8"));
+    for (const name of Object.keys(dotMcp.mcpServers || {})) untrusted.add(name);
     Object.assign(servers, dotMcp.mcpServers || {});
     if (dotMcp.settings) Object.assign(settings, dotMcp.settings);
   } catch {
     /* no .mcp.json in cwd — fine */
   }
-  return { servers, settings };
+  return { servers, settings, untrusted };
 }
 
 function readPromptText(config) {
@@ -137,6 +146,7 @@ export function buildSystemPrompt(config, skills) {
     "# Environment",
     `Working directory: ${process.cwd()}`,
     `Platform: ${process.platform}`,
+    `NimAgent install root (your own extensions/, skills/, docs/): ${INSTALL_ROOT}`,
   ].join("\n");
   let sk = "";
   if (skills && skills.length) {

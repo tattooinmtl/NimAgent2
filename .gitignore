@@ -25,8 +25,14 @@ node_modules/
 Thumbs.db
 .DS_Store
 
-# Local working notes (no markdown in repo except README.md)
-docs/
+# Local working notes stay out of the repo, but shipped reference docs are
+# whitelisted (skills/extend-nimagent points users at docs/EXTENDING.md).
+docs/*
+!docs/EXTENDING.md
+!docs/TESTED_FEATURES.md
+!docs/LIVE_TEST_*.md
+!docs/SECURITY_AUDIT_*.md
+!docs/PLAN_*.md
 *.bak
 *.bak?
 *.backup

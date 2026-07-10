@@ -1,7 +1,10 @@
 // Regression suite for the tolerant text-protocol tool-call parser.
 // Run: node tests/toolcalls.test.mjs
 
-import { parseTextToolCalls, buildParamRegistry, stripToolCallText, hasToolIntent } from "../src/core/toolcalls.mjs";
+import {
+  parseTextToolCalls, buildParamRegistry, stripToolCallText, hasToolIntent,
+  createThinkSplitter, extractThink, stripThink,
+} from "../src/core/toolcalls.mjs";
 import { tools } from "../src/tools/index.mjs";
 
 const reg = buildParamRegistry(tools);
@@ -85,6 +88,68 @@ checkBool("intent detect", hasToolIntent("<tool_call>garbage") === true);
 checkBool("intent negative", hasToolIntent("normal text") === false);
 checkBool("strip removes closed + unclosed blocks",
   stripToolCallText(`Before.<tool_call>x</tool_call>After.<tool_call>unclosed...`) === "Before.After.");
+
+// ── Live <think> stream splitter (createThinkSplitter) ──────────────────────
+// Feeds a sequence of chunks (simulating provider token deltas) through the
+// splitter, calls flush() at the end, and checks the reconstructed think/answer.
+function checkSplit(label, chunks, expected) {
+  const s = createThinkSplitter();
+  let think = "", answer = "";
+  for (const chunk of chunks) {
+    const r = s.feed(chunk);
+    think += r.think;
+    answer += r.answer;
+  }
+  const r = s.flush();
+  think += r.think;
+  answer += r.answer;
+  const got = { think, answer };
+  const ok = JSON.stringify(got) === JSON.stringify(expected);
+  if (ok) { pass++; console.log(`  ✓ ${label}`); }
+  else {
+    fail++;
+    console.log(`  ✗ ${label}\n    expected: ${JSON.stringify(expected)}\n    got:      ${JSON.stringify(got)}`);
+  }
+}
+
+checkSplit("no think content — all answer",
+  ["The bug is ", "in line 42."],
+  { think: "", answer: "The bug is in line 42." });
+
+checkSplit("single think block in one chunk",
+  ["<think>plan first</think>Here is the fix."],
+  { think: "plan first", answer: "Here is the fix." });
+
+checkSplit("think tag split across chunk boundaries",
+  ["prefix ", "<th", "ink>reasoning here</th", "ink> answer text"],
+  { think: "reasoning here", answer: "prefix  answer text" });
+
+checkSplit("closing tag split across chunk boundaries",
+  ["<think>step one step two", "</th", "ink>done"],
+  { think: "step one step two", answer: "done" });
+
+checkSplit("multiple think blocks",
+  ["<think>a</think>mid<think>b</think>end"],
+  { think: "ab", answer: "midend" });
+
+checkSplit("unclosed trailing think block revealed only by flush",
+  ["intro<think>never closes"],
+  { think: "never closes", answer: "intro" });
+
+checkBool("extractThink captures reasoning and strips it",
+  JSON.stringify(extractThink("<think>because X</think>The answer is Y.")) ===
+  JSON.stringify({ think: "because X", rest: "The answer is Y." }));
+
+checkBool("extractThink is a no-op when there's no think block",
+  JSON.stringify(extractThink("just an answer")) ===
+  JSON.stringify({ think: "", rest: "just an answer" }));
+
+checkBool("extractThink treats an unclosed trailing block as reasoning, not a leaked tag",
+  JSON.stringify(extractThink("intro<think>cut off mid-thought")) ===
+  JSON.stringify({ think: "cut off mid-thought", rest: "intro" }));
+
+checkBool("stripThink drops an unclosed trailing block instead of leaking the tag",
+  stripThink("intro<think>cut off mid-thought") === "intro");
 
 console.log(`\n  ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

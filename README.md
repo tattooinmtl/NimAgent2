@@ -129,6 +129,20 @@ JSON-in-`<tool_call>`, bare `<function=…>`, unclosed envelopes, hybrids — wi
 schema-aware argument coercion. Unparseable or truncated tool calls trigger a
 corrective retry instead of silently ending the turn.
 
+## Extending
+
+Three extension points, one package format — see [docs/EXTENDING.md](docs/EXTENDING.md):
+
+- **Extensions** — drop an ESM file exporting `{ name, tools, impl }` into
+  `extensions/` and list it in `nimagent.config.json` to give the agent new tools
+- **Skills** — a `skills/<name>/SKILL.md` with frontmatter becomes a `/slash-command`
+  (auto-discovered at startup)
+- **MCP servers** — add to `mcpServers` in the config or a project-local `.mcp.json`
+- **Packages** — zip any of the above with a `nimpkg.json` and host it behind a
+  static `registry.json` for `/install`
+
+Inside the REPL, `/extend` walks the agent through scaffolding one for you.
+
 ## Layout
 
 ```

@@ -33,6 +33,10 @@ const DEFAULT_SETTINGS = {
   reasoning: "medium",
   maxToolIterations: 30,
   diffPreview: true,
+  // When false (default), live <think>…</think> reasoning is collapsed behind
+  // a spinner + one-line summary; /thinking on shows it inline, dimmed, as it
+  // streams. /thinking last reprints the most recent turn's reasoning either way.
+  showThinking: false,
   // Per-tool permission states: "allow" (silent), "deny" (blocked with an
   // error), or "ask" (interactive confirmation). "*" sets the default for
   // tools not listed. Manage from the REPL with /perm.
@@ -204,12 +208,18 @@ function loadDotEnv() {
 
 // Allow env var overrides for API keys: NIMAGENT_<PROVIDER>_KEY
 function applyEnvKeyOverrides(settings) {
+  // Env/.env keys are runtime-only overrides. Remember each provider's on-disk
+  // key in settings._env so saveSettings can restore it instead of persisting
+  // the secret into settings.json (saveSettings drops _env itself).
+  const savedKeys = {};
   for (const [name, prov] of Object.entries(settings.providers)) {
     const envKey = `NIMAGENT_${name.toUpperCase()}_KEY`;
     if (process.env[envKey]) {
+      savedKeys[name] = prov.apiKey || "";
       prov.apiKey = process.env[envKey];
     }
   }
+  settings._env = { savedKeys };
 }
 
 function migrateSettings(settings) {
@@ -285,7 +295,24 @@ export async function loadSettings() {
 export async function saveSettings(settings) {
   ensureHome();
   const { _env, ...clean } = settings; // drop any runtime-only fields
-  await fs.promises.writeFile(SETTINGS_PATH, JSON.stringify(clean, null, 2), { encoding: "utf8" });
+  // Providers whose key came from the environment keep their original on-disk
+  // value — unless the user changed the key this session (e.g. /apikey), in
+  // which case the new value is intentional and persists.
+  if (_env?.savedKeys) {
+    clean.providers = { ...clean.providers };
+    for (const [name, savedKey] of Object.entries(_env.savedKeys)) {
+      const prov = clean.providers[name];
+      const envVal = process.env[`NIMAGENT_${name.toUpperCase()}_KEY`];
+      if (prov && prov.apiKey === envVal) {
+        clean.providers[name] = { ...prov, apiKey: savedKey };
+      }
+    }
+  }
+  // Write-then-rename so a crash mid-write can never truncate settings.json
+  // (which may hold API keys) to an empty file.
+  const tmp = SETTINGS_PATH + ".tmp";
+  await fs.promises.writeFile(tmp, JSON.stringify(clean, null, 2), { encoding: "utf8" });
+  await fs.promises.rename(tmp, SETTINGS_PATH);
 }
 
 export function resolveModel(settings, modelKey) {

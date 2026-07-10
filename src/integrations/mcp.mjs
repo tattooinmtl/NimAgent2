@@ -13,17 +13,83 @@
 
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { HOME } from "../core/config.mjs";
 import { tools, impl } from "../tools/index.mjs";
 
 const CACHE_PATH = path.join(HOME, "mcp-cache.json");
+const TRUST_PATH = path.join(HOME, "mcp-trust.json");
 const RPC_TIMEOUT = 30000;
 
 let servers = {}; // { name: def }
 let settings = { idleTimeout: 10, directTools: false };
+let untrustedNames = new Set(); // names sourced from a project-local .mcp.json
+let confirmServer = null; // (name, target) => Promise<boolean> — set by the REPL
 const connections = new Map(); // name -> conn
+
+// Lets the REPL supply a human-confirm callback once it has one (see
+// repl.mjs). One-shot/non-interactive runs never call this, so untrusted
+// servers there hit the "no one to ask" branch in ensureConnected and refuse
+// to connect rather than silently proceeding.
+export function setMcpConfirm(fn) {
+  confirmServer = fn;
+}
+
+// ---- per-project trust cache ------------------------------------------------
+// A server from .mcp.json is trusted once its exact definition (command/args/
+// env or url/headers) has been confirmed for this cwd. Any change to the
+// definition changes the fingerprint and re-triggers confirmation — a repo
+// can't get one host approved and later swap in a different command.
+
+function readTrust() {
+  try {
+    return JSON.parse(fs.readFileSync(TRUST_PATH, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function trustKey(name) {
+  return `${process.cwd()}::${name}`;
+}
+
+function defFingerprint(def) {
+  return createHash("sha256").update(JSON.stringify(def)).digest("hex").slice(0, 16);
+}
+
+function isTrusted(name, def) {
+  return readTrust()[trustKey(name)] === defFingerprint(def);
+}
+
+function markTrusted(name, def) {
+  const trust = readTrust();
+  trust[trustKey(name)] = defFingerprint(def);
+  try {
+    fs.mkdirSync(path.dirname(TRUST_PATH), { recursive: true });
+    fs.writeFileSync(TRUST_PATH, JSON.stringify(trust, null, 2));
+  } catch {
+    /* best effort */
+  }
+}
+
+// Minimal environment for stdio MCP servers. Full `process.env` inheritance
+// would hand every configured provider's API key and any other shell secret
+// to whatever command the server config names — set `inheritEnv: true` on a
+// server definition to opt back into full inheritance when a server genuinely
+// needs it (e.g. reading a cloud CLI's own env-based config).
+const SAFE_ENV_KEYS = [
+  "PATH", "Path", "PATHEXT", "SystemRoot", "windir", "TEMP", "TMP", "TMPDIR",
+  "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "HOMEDRIVE", "HOMEPATH",
+  "COMSPEC", "LANG", "LC_ALL", "NODE_ENV", "SHELL",
+];
+
+function baseEnv() {
+  const out = {};
+  for (const k of SAFE_ENV_KEYS) if (process.env[k] !== undefined) out[k] = process.env[k];
+  return out;
+}
 
 // ---- metadata cache --------------------------------------------------------
 
@@ -53,7 +119,7 @@ function cachedTools(name) {
 // ---- transports ------------------------------------------------------------
 
 function connectStdio(name, def) {
-  const env = { ...process.env, ...(def.env || {}) };
+  const env = { ...(def.inheritEnv ? process.env : baseEnv()), ...(def.env || {}) };
   const opts = { env, cwd: def.cwd || process.cwd(), stdio: ["pipe", "pipe", "pipe"] };
 
   // On Windows, npx/uvx/etc. are .cmd shims that bare spawn() can't resolve
@@ -215,6 +281,20 @@ async function ensureConnected(name) {
   }
   const def = servers[name];
   if (!def) throw new Error(`unknown MCP server: ${name}`);
+
+  if (untrustedNames.has(name) && !isTrusted(name, def)) {
+    if (!confirmServer) {
+      throw new Error(
+        `MCP server "${name}" comes from this project's .mcp.json and hasn't been trusted yet. ` +
+        `This session is non-interactive, so there is no one to confirm it with — refusing to connect.`
+      );
+    }
+    const target = def.url || `${def.command} ${(def.args || []).join(" ")}`.trim();
+    const approved = await confirmServer(name, target);
+    if (!approved) throw new Error(`MCP server "${name}" was not trusted — connection refused.`);
+    markTrusted(name, def);
+  }
+
   conn = def.url ? connectHttp(name, def) : connectStdio(name, def);
   connections.set(name, conn);
   await rpc(conn, "initialize", {
@@ -253,6 +333,13 @@ export async function reconnectServer(name) {
 
 // ---- tool discovery helpers ------------------------------------------------
 
+// Set whenever ensureConnected refuses a server (untrusted, non-interactive,
+// declined, etc.) — toolsForServer swallows the error so one bad server
+// doesn't break discovery of the others, but the reason is kept here so
+// mcpProxy can surface WHY a tool wasn't found instead of a bare "not found"
+// that reads the same whether it's a typo or a security refusal.
+const lastConnectError = new Map(); // name -> message
+
 // Tools for a server, preferring a live connection, then the disk cache, then a
 // one-time connect to populate the cache.
 async function toolsForServer(name) {
@@ -262,8 +349,11 @@ async function toolsForServer(name) {
   const cached = cachedTools(name);
   if (cached) return cached;
   try {
-    return (await ensureConnected(name)).tools;
-  } catch {
+    const tools = (await ensureConnected(name)).tools;
+    lastConnectError.delete(name);
+    return tools;
+  } catch (e) {
+    lastConnectError.set(name, e.message);
     return [];
   }
 }
@@ -345,7 +435,14 @@ async function mcpProxy(a = {}) {
   // call a tool
   if (a.tool) {
     const owner = await findToolOwner(a.tool);
-    if (!owner) return `tool "${a.tool}" not found. Try mcp({ search: "..." }).`;
+    if (!owner) {
+      const refusals = names
+        .filter((n) => lastConnectError.has(n))
+        .map((n) => `${n}: ${lastConnectError.get(n)}`);
+      return refusals.length
+        ? `tool "${a.tool}" not found. Some servers refused to connect:\n  ${refusals.join("\n  ")}`
+        : `tool "${a.tool}" not found. Try mcp({ search: "..." }).`;
+    }
     let parsed = {};
     if (a.args) {
       try {
@@ -440,9 +537,10 @@ function registerDirectTool(server, t) {
 export function registerMcpProxy(mcpCfg) {
   servers = mcpCfg.servers || {};
   settings = mcpCfg.settings || { idleTimeout: 10, directTools: false };
+  untrustedNames = mcpCfg.untrusted || new Set();
 
   const names = Object.keys(servers);
-  if (names.length === 0) return { servers: 0, directTools: 0 };
+  if (names.length === 0) return { servers: 0, directTools: 0, names: [], untrusted: [] };
 
   if (!tools.find((t) => t.function?.name === "mcp")) {
     tools.push(proxyToolDef);
@@ -463,5 +561,5 @@ export function registerMcpProxy(mcpCfg) {
     }
   }
 
-  return { servers: names.length, directTools: direct };
+  return { servers: names.length, directTools: direct, names, untrusted: names.filter((n) => untrustedNames.has(n)) };
 }

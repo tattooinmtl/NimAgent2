@@ -25,7 +25,7 @@
     "default": "coding",
     "python": {
       "interpreter": "python",
-      "confidenceThreshold": 0.60,
+      "confidenceThreshold": 0.6,
       "timeoutMs": 150
     }
   },

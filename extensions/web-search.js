@@ -2,8 +2,87 @@
 // Search uses DuckDuckGo directly (no key, no account); web_fetch reads any
 // http(s) page as plain text.
 
+import dns from "node:dns/promises";
+import net from "node:net";
+
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) NimAgent/0.1 (+https://localhost)";
+
+// SSRF guard for web_fetch — a fetched page's content feeds straight into the
+// model (indirect prompt injection), and that page can name any URL for a
+// follow-up fetch. Without this, "read http://169.254.169.254/latest/meta-data/"
+// (cloud instance credentials) or any other internal-only service is one
+// tool call away. Blocks loopback/link-local/private/unique-local ranges on
+// both literal IPs and DNS-resolved hostnames (so a hostname that merely
+// *resolves* to an internal address is caught too, not just a literal IP in
+// the URL).
+function isBlockedIp(ip) {
+  const version = net.isIP(ip);
+  if (version === 4) {
+    const [a, b] = ip.split(".").map(Number);
+    if (a === 127) return true;                        // loopback
+    if (a === 10) return true;                          // private
+    if (a === 172 && b >= 16 && b <= 31) return true;    // private
+    if (a === 192 && b === 168) return true;             // private
+    if (a === 169 && b === 254) return true;             // link-local, incl. cloud metadata
+    if (a === 0) return true;                            // "this network"
+    return false;
+  }
+  if (version === 6) {
+    const low = ip.toLowerCase();
+    if (low === "::1" || low === "::") return true;      // loopback / unspecified
+    if (low.startsWith("fe80:")) return true;            // link-local
+    if (/^f[cd][0-9a-f]{0,2}:/.test(low)) return true;   // unique local (fc00::/7)
+    return false;
+  }
+  return false;
+}
+
+async function assertPublicUrl(urlStr) {
+  const u = new URL(urlStr);
+  if (u.protocol !== "http:" && u.protocol !== "https:") {
+    throw new Error(`unsupported protocol: ${u.protocol}`);
+  }
+  const hostname = u.hostname.replace(/^\[|\]$/g, ""); // strip IPv6 [] brackets
+  if (hostname.toLowerCase() === "localhost") {
+    throw new Error(`refusing to fetch localhost`);
+  }
+  if (net.isIP(hostname)) {
+    if (isBlockedIp(hostname)) throw new Error(`refusing to fetch internal/private address: ${hostname}`);
+    return;
+  }
+  let addrs;
+  try {
+    addrs = await dns.lookup(hostname, { all: true });
+  } catch {
+    throw new Error(`could not resolve host: ${hostname}`);
+  }
+  for (const { address } of addrs) {
+    if (isBlockedIp(address)) {
+      throw new Error(`refusing to fetch — "${hostname}" resolves to an internal/private address (${address})`);
+    }
+  }
+}
+
+// fetch() with redirect:"follow" validates only the FIRST url — a redirect to
+// an internal address would sail through unchecked. Follow redirects
+// ourselves, one hop at a time, re-validating every target.
+async function safeFetch(url, options, maxRedirects = 5) {
+  let current = url;
+  for (let i = 0; i <= maxRedirects; i++) {
+    await assertPublicUrl(current);
+    const res = await fetch(current, { ...options, redirect: "manual" });
+    if ([301, 302, 303, 307, 308].includes(res.status)) {
+      const loc = res.headers.get("location");
+      if (!loc) return res;
+      if (i === maxRedirects) throw new Error("too many redirects");
+      current = new URL(loc, current).toString();
+      continue;
+    }
+    return res;
+  }
+  throw new Error("too many redirects");
+}
 
 async function ddgInstant(query) {
   const url =
@@ -295,9 +374,8 @@ export default {
         if (isYoutubeUrl(url) && extractVideoId(url)) {
           return await youtubeTranscript({ url, max_chars });
         }
-        const res = await fetch(url, {
+        const res = await safeFetch(url, {
           headers: { "User-Agent": UA, Accept: "text/html,application/xhtml+xml,text/plain,*/*" },
-          redirect: "follow",
           signal: AbortSignal.timeout(30000),
         });
         if (!res.ok) return `web_fetch failed: HTTP ${res.status} ${res.statusText}`;
