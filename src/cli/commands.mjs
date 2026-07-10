@@ -10,6 +10,7 @@ import path from "node:path";
 import { c, infoLine, warnLine, errorLine, costLine } from "../ui.mjs";
 import {
   saveSettings, resolveModel, SETTINGS_PATH, HOME, Session,
+  activateAccount, findAccountProvider,
 } from "../core/config.mjs";
 import { runTool, tools } from "../tools/index.mjs";
 import { compactMessages, estimateTokens, getLastThinking } from "../core/agent.mjs";
@@ -420,19 +421,66 @@ export const COMMANDS = [
     handler: (ctx, arg) => providerCommand(ctx, arg),
   },
   {
-    name: "apikey", aliases: [], usage: "/apikey <provider> [key]", category: "Models & Providers",
-    summary: "show or set a provider API key (persisted)",
+    name: "switch-provider", aliases: ["swp"], usage: "/switch-provider [account]", category: "Models & Providers",
+    summary: "switch between provider accounts (e.g. nvidia1 / nvidia2)",
+    handler: async (ctx, arg) => {
+      const target = arg.trim();
+      if (!target) {
+        let any = false;
+        for (const [name, p] of Object.entries(ctx.settings.providers)) {
+          for (const [acct, key] of Object.entries(p.accounts || {})) {
+            any = true;
+            const mark = p.activeAccount === acct ? c.green("● ") : "  ";
+            console.log(`    ${mark}${acct.padEnd(12)} ${c.dim(`${name}  key=${maskKey(key)}`)}`);
+          }
+        }
+        if (!any) infoLine("no provider accounts configured — add keys with /apikey nvidia1 <key> /apikey nvidia2 <key>");
+        infoLine("switch: /switch-provider <account>   (rate-limit failover between accounts is automatic)");
+        return;
+      }
+      const provName = findAccountProvider(ctx.settings, target);
+      if (!provName) { errorLine(`no account "${target}" — /switch-provider lists them`); return; }
+      const prov = ctx.settings.providers[provName];
+      if (!String(prov.accounts[target] || "").trim()) {
+        warnLine(`account ${target} has no API key yet — set it with /apikey ${target} <key> or NIMAGENT_${target.toUpperCase()}_KEY in .env`);
+      }
+      activateAccount(prov, target);
+      await saveSettings(ctx.settings);
+      infoLine(`${provName} now using account ${target} (key=${maskKey(prov.accounts[target])})`);
+    },
+  },
+  {
+    name: "apikey", aliases: [], usage: "/apikey <provider|account> [key]", category: "Models & Providers",
+    summary: "show or set a provider/account API key (persisted)",
     handler: async (ctx, arg) => {
       const [prov, ...rest] = arg.split(/\s+/).filter(Boolean);
       if (!prov) {
-        for (const [name, p] of Object.entries(ctx.settings.providers)) infoLine(`${name}: ${maskKey(p.apiKey)}`);
-        infoLine("usage: /apikey <provider> <key>");
+        for (const [name, p] of Object.entries(ctx.settings.providers)) {
+          infoLine(`${name}: ${maskKey(p.apiKey)}`);
+          for (const [acct, key] of Object.entries(p.accounts || {})) infoLine(`  ${acct}: ${maskKey(key)}`);
+        }
+        infoLine("usage: /apikey <provider|account> <key>   e.g. /apikey nvidia2 <key>");
+        return;
+      }
+      const key = rest.join(" ").trim();
+      // Account names (nvidia1, nvidia2, …) resolve to their owning provider.
+      const owner = ctx.settings.providers[prov] ? null : findAccountProvider(ctx.settings, prov);
+      if (owner) {
+        const p = ctx.settings.providers[owner];
+        if (!key) { infoLine(`${prov} (${owner}): ${maskKey(p.accounts[prov])}`); return; }
+        p.accounts[prov] = key;
+        if (p.activeAccount === prov) activateAccount(p, prov); // refresh mirrored apiKey
+        await saveSettings(ctx.settings);
+        infoLine(`updated API key for account ${prov}: ${maskKey(key)} (saved)`);
         return;
       }
       if (!ctx.settings.providers[prov]) { errorLine(`unknown provider "${prov}" (try /providers, or /addprovider)`); return; }
-      const key = rest.join(" ").trim();
       if (!key) { infoLine(`${prov}: ${maskKey(ctx.settings.providers[prov].apiKey)}`); return; }
-      ctx.settings.providers[prov].apiKey = key;
+      const p = ctx.settings.providers[prov];
+      p.apiKey = key;
+      // Keep the accounts mirror coherent: setting the provider key really
+      // means "set the active account's key" when accounts exist.
+      if (p.accounts && p.activeAccount in p.accounts) p.accounts[p.activeAccount] = key;
       await saveSettings(ctx.settings);
       try { ctx.model = resolveModel(ctx.settings, ctx.model.key); } catch { /* keep current */ }
       infoLine(`updated API key for ${prov}: ${maskKey(key)} (saved)`);

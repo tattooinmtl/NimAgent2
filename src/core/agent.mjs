@@ -2,6 +2,7 @@
 // feed results back, repeat until the model answers with plain text.
 
 import { chatStream, completionStream } from "./provider.mjs";
+import { rotateAccount } from "./config.mjs";
 import { renderTemplate } from "../integrations/router.mjs";
 import { tools, runTool, commandRisk } from "../tools/index.mjs";
 import {
@@ -128,18 +129,33 @@ function messagesWithTextTools(messages) {
 
 // Transient provider errors that are worth retrying automatically.
 const RETRYABLE = /429|50[234]|ResourceExhausted|workers are busy|Service Unavailable/i;
+// The subset that means "this key is throttled" — worth failing over to
+// another account of the same provider before waiting it out.
+const RATE_LIMITED = /429|ResourceExhausted|too many requests|rate.?limit/i;
 const MAX_RETRIES  = 5;
 const BASE_DELAY   = 3000;  // 3s → 6s → 12s → 24s → 48s
+const MAX_ROTATIONS = 4;    // account hops per request before plain backoff
 
 function isRetryable(err) {
   return RETRYABLE.test(err.message || String(err));
 }
 
+function abortableSleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(resolve, ms);
+    signal?.addEventListener("abort", () => { clearTimeout(t); reject(new DOMException("aborted", "AbortError")); }, { once: true });
+  });
+}
+
 // chatStream wrapper with exponential backoff. Retries up to MAX_RETRIES
 // times on transient 429/503/ResourceExhausted errors, showing a countdown
-// so the user knows why the agent paused.
+// so the user knows why the agent paused. When the provider has multiple
+// accounts (settings.providers.<name>.accounts), a rate-limit error first
+// rotates to the next account and retries almost immediately — backoff only
+// kicks in once every account has been tried.
 async function chatStreamWithRetry({ model, messages, tools, signal, onToken, _templatePrompt }) {
   let attempt = 0;
+  let rotations = 0;
   while (true) {
     try {
       if (_templatePrompt != null) {
@@ -150,16 +166,26 @@ async function chatStreamWithRetry({ model, messages, tools, signal, onToken, _t
       // Aborted by user (Ctrl-C / Esc) — propagate immediately, no retry.
       if (e.name === "AbortError" || signal?.aborted) throw e;
       if (!isRetryable(e) || attempt >= MAX_RETRIES) throw e;
+      const msg = e.message || String(e);
+      if (RATE_LIMITED.test(msg) && rotations < MAX_ROTATIONS) {
+        // model.provider is the live settings object, so the rotated key is
+        // picked up by authHeaders on the very next request. Session-only —
+        // the on-disk activeAccount changes via /switch-provider, not here.
+        const next = rotateAccount(model.provider);
+        if (next) {
+          rotations++;
+          warnLine(`rate-limited (${msg.split("\n")[0].slice(0, 60)})`);
+          warnLine(`switching to account ${next} and retrying…`);
+          await abortableSleep(1200, signal);
+          continue;
+        }
+      }
       attempt++;
       const delay = BASE_DELAY * Math.pow(2, attempt - 1);
       const secs  = Math.round(delay / 1000);
-      warnLine(`provider unavailable (${e.message.split("\n")[0].slice(0, 80)})`);
+      warnLine(`provider unavailable (${msg.split("\n")[0].slice(0, 80)})`);
       warnLine(`retrying in ${secs}s… (attempt ${attempt}/${MAX_RETRIES})`);
-      // Respect abort during the wait period.
-      await new Promise((resolve, reject) => {
-        const t = setTimeout(resolve, delay);
-        signal?.addEventListener("abort", () => { clearTimeout(t); reject(new DOMException("aborted", "AbortError")); }, { once: true });
-      });
+      await abortableSleep(delay, signal);
     }
   }
 }

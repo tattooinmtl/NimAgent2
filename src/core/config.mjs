@@ -57,6 +57,12 @@ const DEFAULT_SETTINGS = {
     nvidia: {
       baseUrl: "https://integrate.api.nvidia.com/v1",
       apiKey: "", // get a free key at https://build.nvidia.com
+      // Multiple accounts against the same endpoint. The active account's key
+      // is mirrored into apiKey (which is all the request path ever reads);
+      // switch manually with /switch-provider nvidia1|nvidia2, and the agent
+      // rotates to the next account automatically when one gets rate-limited.
+      accounts: { nvidia1: "", nvidia2: "" },
+      activeAccount: "nvidia1",
       label: "NVIDIA NIM",
       api: "openai-completions",
       nativeTools: false,
@@ -212,20 +218,83 @@ function loadDotEnv() {
   }
 }
 
-// Allow env var overrides for API keys: NIMAGENT_<PROVIDER>_KEY
+// ── provider accounts ────────────────────────────────────────────────────────
+// A provider may define accounts: { name: key } plus activeAccount. The active
+// account's key is mirrored into provider.apiKey — the only field the request
+// path reads (authHeaders, providerKeyMissing, /providers …) — so switching
+// accounts is invisible to everything downstream.
+
+// Make `name` the active account. Only mirrors a non-empty key into apiKey so
+// a legacy setup (key on apiKey, accounts still blank) keeps working.
+export function activateAccount(provider, name) {
+  if (!provider?.accounts || !(name in provider.accounts)) return false;
+  provider.activeAccount = name;
+  const key = String(provider.accounts[name] || "").trim();
+  if (key) provider.apiKey = key;
+  return true;
+}
+
+// Rotate to the next account that actually holds a key. Returns its name, or
+// null when there is nowhere to go (fewer than two usable accounts).
+export function rotateAccount(provider) {
+  const usable = Object.entries(provider?.accounts || {})
+    .filter(([, k]) => String(k || "").trim())
+    .map(([n]) => n);
+  if (usable.length < 2) return null;
+  const next = usable[(usable.indexOf(provider.activeAccount) + 1) % usable.length];
+  if (next === provider.activeAccount) return null;
+  activateAccount(provider, next);
+  return next;
+}
+
+// Which provider owns an account name (for /switch-provider nvidia2, /apikey nvidia2).
+export function findAccountProvider(settings, name) {
+  for (const [provName, prov] of Object.entries(settings.providers || {})) {
+    if (prov.accounts && name in prov.accounts) return provName;
+  }
+  return null;
+}
+
+// Allow env var overrides for API keys: NIMAGENT_<PROVIDER>_KEY, and per
+// account NIMAGENT_<ACCOUNT>_KEY (e.g. NIMAGENT_NVIDIA1_KEY).
 function applyEnvKeyOverrides(settings) {
   // Env/.env keys are runtime-only overrides. Remember each provider's on-disk
   // key in settings._env so saveSettings can restore it instead of persisting
   // the secret into settings.json (saveSettings drops _env itself).
   const savedKeys = {};
+  // Per-account bookkeeping: { provider: { account: { was, imposed } } }.
+  // `was` is the on-disk value to restore; `imposed` is what the environment
+  // (or the legacy-key seed below) put there — if the value changed since
+  // (e.g. /apikey nvidia1 <key>), the change is the user's and persists.
+  const savedAccounts = {};
   for (const [name, prov] of Object.entries(settings.providers)) {
     const envKey = `NIMAGENT_${name.toUpperCase()}_KEY`;
     if (process.env[envKey]) {
       savedKeys[name] = prov.apiKey || "";
       prov.apiKey = process.env[envKey];
     }
+    const acctNames = Object.keys(prov.accounts || {});
+    for (const acct of acctNames) {
+      const acctEnv = `NIMAGENT_${acct.toUpperCase()}_KEY`;
+      if (process.env[acctEnv]) {
+        (savedAccounts[name] ||= {})[acct] = { was: prov.accounts[acct] || "", imposed: process.env[acctEnv] };
+        prov.accounts[acct] = process.env[acctEnv];
+      }
+    }
+    if (acctNames.length) {
+      // Legacy single-key setups: an apiKey (from disk or env) with an empty
+      // first account seeds that account, so switching/failover has a base.
+      const first = acctNames[0];
+      if (!String(prov.accounts[first] || "").trim() && String(prov.apiKey || "").trim()) {
+        if (process.env[envKey]) {
+          (savedAccounts[name] ||= {})[first] = { was: "", imposed: prov.apiKey };
+        }
+        prov.accounts[first] = prov.apiKey;
+      }
+      if (prov.activeAccount) activateAccount(prov, prov.activeAccount);
+    }
   }
-  settings._env = { savedKeys };
+  settings._env = { savedKeys, savedAccounts };
 }
 
 function migrateSettings(settings) {
@@ -313,6 +382,29 @@ export async function saveSettings(settings) {
       if (prov && prov.apiKey === envVal) {
         clean.providers[name] = { ...prov, apiKey: savedKey };
       }
+    }
+  }
+  // Same restoration for account keys that came from the environment (or from
+  // the legacy-key seed): still holding the imposed value → put back the
+  // on-disk one; changed since (e.g. /apikey nvidia1 <key>) → persist.
+  if (_env?.savedAccounts) {
+    clean.providers = { ...clean.providers };
+    for (const [name, accts] of Object.entries(_env.savedAccounts)) {
+      const prov = clean.providers[name];
+      if (!prov?.accounts) continue;
+      const accounts = { ...prov.accounts };
+      for (const [acct, rec] of Object.entries(accts)) {
+        if (accounts[acct] === rec.imposed) accounts[acct] = rec.was;
+      }
+      clean.providers[name] = { ...prov, accounts };
+    }
+  }
+  // For accounts-providers, the on-disk apiKey must mirror the *cleaned*
+  // active-account value — the runtime apiKey may hold an env-sourced key
+  // that must never land in settings.json.
+  for (const [name, prov] of Object.entries(clean.providers)) {
+    if (prov.accounts && prov.activeAccount && prov.activeAccount in prov.accounts) {
+      clean.providers[name] = { ...prov, apiKey: prov.accounts[prov.activeAccount] || "" };
     }
   }
   // Write-then-rename so a crash mid-write can never truncate settings.json

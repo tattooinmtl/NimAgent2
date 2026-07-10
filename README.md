@@ -38,6 +38,17 @@ $env:NIMAGENT_NVIDIA_KEY = "nvapi-xxxxxxxx"             # or an env var (overrid
 # …or inside the REPL:  /apikey nvidia nvapi-xxxxxxxx
 ```
 
+Got a second NVIDIA account? Give each its own key and NimAgent fails over to
+the other one automatically when a key gets rate-limited (429), instead of
+waiting out the backoff:
+
+```powershell
+# .env (or the REPL: /apikey nvidia1 <key>  /apikey nvidia2 <key>)
+NIMAGENT_NVIDIA1_KEY=nvapi-xxxxxxxx
+NIMAGENT_NVIDIA2_KEY=nvapi-yyyyyyyy
+# switch manually anytime:  /switch-provider nvidia1|nvidia2   (alias /swp)
+```
+
 Secrets policy: the repo contains **no keys and no user data** — only
 [`settings.example.json`](settings.example.json) and [`.env.example`](.env.example)
 with empty placeholders. `agent/`, `.env`, and `vendor/` are git-ignored.
@@ -58,8 +69,8 @@ Tab completes `/commands`. `/help` shows this grouped menu with usage strings.
 | Category | Commands |
 |---|---|
 | Session | `/help` `/status` `/clear` `/compact [now]` `/resume` `/cost` `/cwd` `/config` `/version` `/exit` |
-| Agent | `/goal` `/effort` `/route` `/diff` `/memory` `/tools` `/perm` |
-| Models & Providers | `/model` `/models` `/default` `/doctor` `/addmodel` `/providers` `/provider` `/apikey` `/addprovider` `/llama` |
+| Agent | `/goal` `/effort` `/route` `/diff` `/memory` `/tools` `/perm` `/workspace` |
+| Models & Providers | `/model` `/models` `/default` `/doctor` `/addmodel` `/providers` `/provider` `/apikey` `/switch-provider` `/addprovider` `/llama` |
 | Packages & Integrations | `/packages` `/install` `/uninstall` `/mcp` `/bridge` |
 
 Unknown commands get a nearest-match suggestion. Multi-line input: end a line
@@ -98,10 +109,31 @@ as `high` to OpenAI-compatible APIs).
 `/perm <tool|*> <allow|deny|ask>` — persisted in `settings.json`. In one-shot
 mode `ask` behaves as `deny`.
 
+### Workspace & folder trust
+
+File tools are sandboxed to the workspace root (symlink-aware — no `..` or
+link escapes). Where that root lands depends on how you launch:
+
+- **From nowhere in particular** (home, Documents, a drive root): NimAgent
+  creates and enters the **workflow hub** — `Documents\NimAgentWorkflow` — the
+  home for every project it builds. If your Documents folder is OneDrive-synced,
+  the first run offers a local `C:\NimAgentWorkflow` instead (build output and
+  sync clients don't mix). The choice persists in `settings.json`.
+- **Inside a project folder** (`nim2` in a repo): a one-time *"trust this
+  folder?"* prompt — trusted folders are cached in `agent/folder-trust.json`,
+  declining drops you into the hub instead.
+
+`/workspace` shows root/trust/scope, `/workspace trust|untrust` manages the
+cache, and `/workspace scope system` (extra confirm) lifts the sandbox
+machine-wide when you really want the agent working across the whole PC —
+`/workspace scope folder` puts the walls back up.
+
 ## Tools the agent can use
 
 - **Files & code** — `read_file`, `read_many_files`, `write_file`, `edit_file`,
-  `apply_patch`, `list_dir`, `find_files` (fd), `search` (ripgrep), `jq_query`
+  `apply_patch`, `list_dir`, `find_files` (fd), `search` (ripgrep),
+  `find_replace` (ripgrep-powered multi-file replace), `rename_symbol`
+  (semantic whole-workspace rename via the language server), `jq_query`
 - **Shell & processes** — `run_shell` (PowerShell), `run_test`,
   `start_process` / `process_status` / `stop_process`
 - **Project & git** — `project_inspect`, `project_todo`, `git_status`,
