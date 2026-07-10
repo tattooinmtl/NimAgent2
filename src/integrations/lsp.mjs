@@ -126,6 +126,7 @@ class LspClient {
     this.diagnostics = new Map();  // uri -> Diagnostic[]
     this.openDocs = new Map();     // absPath -> mtimeMs at didOpen
     this.ready = null;             // initialize promise
+    this.serverCapabilities = null; // set once initialize responds
   }
 
   async start() {
@@ -163,7 +164,7 @@ class LspClient {
     await spawned;
 
     const rootUri = pathToFileURL(process.cwd()).href;
-    await this.request("initialize", {
+    const initResult = await this.request("initialize", {
       processId: process.pid,
       rootUri,
       initializationOptions: this.lang.initOptions ? this.lang.initOptions() : undefined,
@@ -172,9 +173,11 @@ class LspClient {
         textDocument: {
           hover: { contentFormat: ["plaintext", "markdown"] },
           documentSymbol: { hierarchicalDocumentSymbolSupport: true },
+          rename: { prepareSupport: false },
         },
       },
     }, 20000);
+    this.serverCapabilities = initResult?.capabilities || {};
     this.notify("initialized", {});
   }
 
@@ -327,6 +330,107 @@ function formatDiagnostics(diags) {
   return diags.slice(0, 100).map((d) =>
     `${SEV[d.severity] || "info"} ${d.range.start.line + 1}:${d.range.start.character + 1} ${d.message}${d.source ? ` [${d.source}]` : ""}`
   ).join("\n");
+}
+
+// ── Workspace-edit handling (rename) ────────────────────────────────────────
+//
+// textDocument/rename returns a WorkspaceEdit, which servers express either as
+// `changes: { uri: TextEdit[] }` (older/simpler) or `documentChanges: [...]`
+// (newer; the spec says a client that understands documentChanges should
+// prefer it when both are present). documentChanges can also contain
+// CreateFile/RenameFile/DeleteFile operations — genuinely rare for a plain
+// symbol rename, and NOT applied here: silently dropping part of a rename
+// would leave the workspace in a worse, inconsistent state than refusing the
+// whole thing, so an edit containing one is rejected with a clear reason
+// instead.
+function normalizeWorkspaceEdit(edit) {
+  const byUri = new Map(); // uri -> TextEdit[]
+  if (edit?.documentChanges) {
+    for (const change of edit.documentChanges) {
+      if (change.kind === "create" || change.kind === "rename" || change.kind === "delete") {
+        throw new Error(
+          `this rename also wants to ${change.kind} a file (${change.uri || change.oldUri || ""}) — ` +
+          `not supported yet, do that part manually`
+        );
+      }
+      const uri = change.textDocument?.uri;
+      if (!uri) continue;
+      byUri.set(uri, [...(byUri.get(uri) || []), ...(change.edits || [])]);
+    }
+  } else if (edit?.changes) {
+    for (const [uri, edits] of Object.entries(edit.changes)) {
+      byUri.set(uri, [...(byUri.get(uri) || []), ...edits]);
+    }
+  }
+  return byUri;
+}
+
+// Apply a list of (possibly overlapping-free) LSP TextEdits to a string.
+// Edits carry [start,end) line/character ranges into the ORIGINAL document;
+// applying them from the end of the document backward means earlier edits
+// never shift the offsets later edits still need to be valid against.
+function applyTextEdits(text, edits) {
+  const lines = text.split("\n");
+  const offsetOf = (pos) => {
+    let off = 0;
+    for (let i = 0; i < pos.line; i++) off += lines[i].length + 1; // +1 for the \n
+    return off + pos.character;
+  };
+  const sorted = [...edits].sort((a, b) => offsetOf(b.range.start) - offsetOf(a.range.start));
+  let out = text;
+  for (const e of sorted) {
+    const start = offsetOf(e.range.start);
+    const end = offsetOf(e.range.end);
+    out = out.slice(0, start) + e.newText + out.slice(end);
+  }
+  return out;
+}
+
+// Computes a rename's full multi-file edit PURELY IN MEMORY — nothing is
+// written to disk here. The caller (rename_symbol in tools/index.mjs) is
+// responsible for validating every touched path against the workspace
+// boundary before writing anything, the same as every other write tool does;
+// this function doesn't know about that boundary and shouldn't bypass it.
+export async function lspRenamePlan({ path: p, line, character, newName }) {
+  const abs = path.resolve(process.cwd(), p);
+  if (!fs.existsSync(abs)) throw new Error(`File not found: ${p}`);
+  if (!Number.isInteger(line) || line < 1) throw new Error(`rename needs a 1-based "line" (and optional "character")`);
+  const name = String(newName || "").trim();
+  if (!name || /\s/.test(name)) throw new Error(`newName must be a single non-empty identifier, got: "${newName}"`);
+
+  const lang = languageFor(abs);
+  if (!lang) throw new Error(`no LSP language configured for "${path.extname(abs)}" files (supported: ${LANGUAGES.flatMap((l) => l.exts).join(" ")})`);
+
+  const client = await getClient(lang);
+  if (client.serverCapabilities?.renameProvider === false) {
+    throw new Error(`the ${lang.id} language server does not support rename`);
+  }
+  client.openDoc(abs);
+  const uri = pathToFileURL(abs).href;
+  const position = { line: line - 1, character: Math.max(0, (character || 1) - 1) };
+
+  const edit = await client.request("textDocument/rename", { textDocument: { uri }, position, newName: name }, 20000);
+  const byUri = normalizeWorkspaceEdit(edit);
+  if (byUri.size === 0) return { files: [], totalEdits: 0 };
+
+  const files = [];
+  let totalEdits = 0;
+  for (const [fileUri, edits] of byUri) {
+    let filePath;
+    try { filePath = fileURLToPath(fileUri); } catch { continue; }
+    if (!fs.existsSync(filePath)) throw new Error(`rename touches a file that doesn't exist on disk: ${filePath}`);
+    const oldContent = fs.readFileSync(filePath, "utf8");
+    const newContent = applyTextEdits(oldContent, edits);
+    files.push({
+      absPath: filePath,
+      relPath: path.relative(process.cwd(), filePath).replace(/\\/g, "/"),
+      oldContent,
+      newContent,
+      editCount: edits.length,
+    });
+    totalEdits += edits.length;
+  }
+  return { files, totalEdits };
 }
 
 // ── Public entry used by the lsp tool ──────────────────────────────────────

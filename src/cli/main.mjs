@@ -19,10 +19,23 @@ import { classifyIntent, warmSidecar } from "../integrations/router.mjs";
 import { applySkill, reportMissingKey, reportInsecureEndpoint, maskKey } from "./helpers.mjs";
 import { activeModelBlockedByHealth } from "./models.mjs";
 import { registerGoalTool } from "./goal.mjs";
+import { initWorkspace } from "../core/workspace.mjs";
 import { startRepl } from "./repl.mjs";
 
 export async function main(args) {
   const settings = await loadSettings();
+
+  // Workspace selection (core/workspace.mjs) must precede anything that reads
+  // the cwd — .mcp.json discovery, session slugs, project detection — because
+  // it may chdir into the workflow hub or ask to trust the launch folder.
+  // Package/key subcommands never touch the workspace, so they skip it.
+  const PKG_CMDS = new Set(["install", "uninstall", "remove", "list", "search"]);
+  if (!PKG_CMDS.has(args[0]) && !args.includes("--set-key")) {
+    await initWorkspace({
+      settings,
+      interactive: Boolean(process.stdin.isTTY && process.stdout.isTTY),
+    });
+  }
 
   // Project config: extensions + skills + prompt (nimagent.config.json).
   const project = loadProjectConfig();
@@ -43,7 +56,6 @@ export async function main(args) {
 
   // Package-management subcommands run once and exit (no model/API key needed):
   //   nimagent install <name> | uninstall <name> | list | search <query>
-  const PKG_CMDS = new Set(["install", "uninstall", "remove", "list", "search"]);
   if (PKG_CMDS.has(args[0])) {
     const [sub, ...rest] = args;
     const baseUrl = process.env.NIMAGENT_REGISTRY || project.registry || DEFAULT_REGISTRY;

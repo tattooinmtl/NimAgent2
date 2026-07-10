@@ -25,6 +25,9 @@ import {
   setEffortTier, fetchModelsForProvider, doctorModel, switchModel,
   pickModelWithArrows, modelHealthLabel, printProviderPresets, installProviderPreset,
 } from "./models.mjs";
+import {
+  getWorkspaceScope, setAndSaveScope, isFolderTrusted, trustFolder, untrustFolder,
+} from "../core/workspace.mjs";
 import { llamaCommand } from "./llama-cmd.mjs";
 import { goalCommand, goalStatusLine } from "./goal.mjs";
 import { providerKeyEnvVar } from "../core/config.mjs";
@@ -274,6 +277,38 @@ export const COMMANDS = [
         infoLine(`permission override removed for ${toolName}`);
       } else {
         errorLine("usage: /perm            (list)  |  /perm <tool|*> <allow|deny|ask>  |  /perm <tool> clear");
+      }
+    },
+  },
+  {
+    name: "workspace", aliases: ["ws"], usage: "/workspace [scope folder|system | trust | untrust]", category: "Agent",
+    summary: "show or change the workspace sandbox (root, trust, write scope)",
+    handler: async (ctx, arg) => {
+      const [sub, value] = arg.trim().split(/\s+/).filter(Boolean);
+      const cwd = process.cwd();
+      if (!sub) {
+        const hub = ctx.settings.workspace?.root || "(not set — picked on first launch)";
+        infoLine(`workspace root: ${cwd}`);
+        infoLine(`workflow hub:   ${hub}`);
+        infoLine(`trusted here:   ${isFolderTrusted(cwd) ? "yes" : "no (hub folders are implicitly trusted)"}`);
+        const scope = getWorkspaceScope();
+        infoLine(`write scope:    ${scope}${scope === "system" ? "  (file tools may touch the WHOLE machine)" : "  (file tools confined to the workspace root)"}`);
+      } else if (sub === "scope" && (value === "folder" || value === "system")) {
+        if (value === "system") {
+          // Escaping the sandbox is the one decision that must never happen
+          // silently — confirm even though the human typed the command.
+          const answer = await ctx.confirmToolUse?.("workspace scope system", "lets the agent read/write ANYWHERE on this PC");
+          if (!/^(y|yes|a|always)$/i.test(String(answer || "").trim())) { infoLine("scope unchanged."); return; }
+        }
+        await setAndSaveScope(ctx.settings, value);
+        infoLine(`workspace scope: ${value}`);
+      } else if (sub === "trust") {
+        trustFolder(cwd);
+        infoLine(`trusted ${cwd}`);
+      } else if (sub === "untrust") {
+        infoLine(untrustFolder(cwd) ? `trust revoked for ${cwd} (takes effect next launch)` : "this folder was not in the trust list");
+      } else {
+        errorLine("usage: /workspace            (status)  |  /workspace scope <folder|system>  |  /workspace trust|untrust");
       }
     },
   },

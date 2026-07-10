@@ -41,6 +41,12 @@ const DEFAULT_SETTINGS = {
   // error), or "ask" (interactive confirmation). "*" sets the default for
   // tools not listed. Manage from the REPL with /perm.
   permissions: {},
+  // Workspace sandbox (see core/workspace.mjs). root is the workflow hub every
+  // project lands in when NimAgent isn't launched inside a trusted folder
+  // (empty = pick on first run: Documents\NimAgentWorkflow, or C:\NimAgentWorkflow
+  // if the user opts out of OneDrive). scope "folder" confines file tools to
+  // the workspace; "system" lifts containment machine-wide. Manage with /workspace.
+  workspace: { root: "", scope: "folder" },
   providers: {
     openai: {
       baseUrl: "https://api.openai.com/v1",
@@ -278,6 +284,7 @@ export async function loadSettings() {
       providers:   mergeProviders(saved.providers),
       models:      { ...DEFAULT_SETTINGS.models, ...(saved.models || {}) },
       permissions: { ...(saved.permissions || {}) },
+      workspace:   { ...DEFAULT_SETTINGS.workspace, ...(saved.workspace || {}) },
     };
     migrateSettings(settings);
     applyEnvKeyOverrides(settings);

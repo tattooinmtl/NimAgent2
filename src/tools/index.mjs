@@ -10,8 +10,9 @@ import { spawn, spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import { rgPath, fdPath, jqPath, INSTALL_ROOT } from "../paths.mjs";
 import { HOME } from "../core/config.mjs";
+import { getWorkspaceScope } from "../core/workspace.mjs";
 import { buildIndex as ragBuild, searchIndex as ragSearch } from "../integrations/rag.mjs";
-import { lspRequest } from "../integrations/lsp.mjs";
+import { lspRequest, lspRenamePlan } from "../integrations/lsp.mjs";
 
 const MAX_OUTPUT = 30000;
 const PROCESS_LOG_LIMIT = 20000;
@@ -34,6 +35,10 @@ function workspaceRoot() {
 // ancestor (the target may not exist yet — e.g. a new file being created) and
 // reattach the not-yet-existing suffix before re-checking containment.
 function assertInsideWorkspace(full, label = "path") {
+  // "system" scope (settings.workspace.scope, set by the human via
+  // /workspace scope system) lifts containment: the user has explicitly
+  // granted the whole machine.
+  if (getWorkspaceScope() === "system") return full;
   const root = workspaceRoot();
   const rel = path.relative(root, full);
   if (rel !== "" && (rel.startsWith("..") || path.isAbsolute(rel))) {
@@ -338,6 +343,27 @@ export const tools = [
           context: { type: "integer", description: "Number of context lines before/after each match (default 0)" },
         },
         required: ["pattern"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "find_replace",
+      description:
+        "Find-and-replace across every matching file in one call (ripgrep-powered) — for renames search+edit_file can't do semantically: string literals, config keys, comments, non-code text. Prefer rename_symbol for a code identifier when a language server is available; use this for everything else, or as a fallback. Literal substring match by default; set regex=true for a pattern with capture groups ($1, $2, ... in replacement). Use dry_run=true to preview affected files/counts before writing.",
+      parameters: {
+        type: "object",
+        properties: {
+          pattern: { type: "string", description: "Text to find — literal substring by default, or a regex when regex=true" },
+          replacement: { type: "string", description: "Replacement text. In regex mode, $1/$2/$& backreferences work; in literal mode, inserted exactly as given." },
+          path: { type: "string", description: "Directory or file to search (default cwd)" },
+          glob: { type: "string", description: "Optional glob filter, e.g. *.ts" },
+          case_insensitive: { type: "boolean", description: "Case-insensitive match (default false)" },
+          regex: { type: "boolean", description: "Treat pattern as a regex instead of a literal string (default false)" },
+          dry_run: { type: "boolean", description: "Preview affected files/occurrence counts without writing" },
+        },
+        required: ["pattern", "replacement"],
       },
     },
   },
@@ -677,6 +703,25 @@ export const tools = [
           character: { type: "integer", description: "1-based column, default 1" },
         },
         required: ["action", "path"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "rename_symbol",
+      description:
+        "Semantic rename via the Language Server — updates every reference across the whole workspace atomically (unlike search + edit_file per file). Point at one usage or the declaration; the server finds the rest. Same language support as lsp. Use dry_run=true to preview which files/how many edits before writing.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "File containing the symbol" },
+          line: { type: "integer", description: "1-based line of the symbol" },
+          character: { type: "integer", description: "1-based column, default 1" },
+          new_name: { type: "string", description: "The new identifier name" },
+          dry_run: { type: "boolean", description: "Preview affected files/edit counts without writing" },
+        },
+        required: ["path", "line", "new_name"],
       },
     },
   },
@@ -1030,6 +1075,89 @@ export const impl = {
     return clip(r.stdout || r.stderr || "(no matches)");
   },
 
+  find_replace({ pattern, replacement, path: p = ".", glob, case_insensitive = false, regex = false, dry_run = false }) {
+    if (!pattern) throw new Error("pattern is required");
+    if (replacement == null) throw new Error("replacement is required");
+    const root = resolve(p);
+
+    // Find candidate files with ripgrep (same conventions as `search`); the
+    // actual substitution happens in JS below so this needs the file list,
+    // not per-line matches.
+    const args = ["--files-with-matches", "--color", "never"];
+    if (case_insensitive) args.push("-i");
+    if (!regex) args.push("--fixed-strings");
+    if (glob) args.push("--glob", glob);
+    args.push("-e", pattern, root);
+    const r = spawnSync(rgPath(), args, { encoding: "utf8", maxBuffer: 1024 * 1024 * 16 });
+    if (r.error) throw new Error("find_replace requires ripgrep: " + r.error.message);
+    if (r.status === 1) return "(no matches)";
+    if (r.status !== 0) return clip(r.stderr || `ripgrep exited with code ${r.status}`);
+
+    const files = (r.stdout || "").split("\n").map((s) => s.trim()).filter(Boolean);
+    if (!files.length) return "(no matches)";
+
+    let re;
+    try {
+      const source = regex ? pattern : pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      re = new RegExp(source, case_insensitive ? "gi" : "g");
+    } catch (e) {
+      throw new Error(`invalid pattern: ${e.message}`);
+    }
+
+    const results = [];
+    for (const file of files) {
+      let content;
+      try { content = fs.readFileSync(file, "utf8"); } catch { continue; }
+      if (content.includes("\0")) continue; // binary file — skip
+
+      let updated;
+      let count;
+      if (regex) {
+        // Regex mode: replacement can use $1/$2/$&/$$ backreferences against
+        // capture groups — the string form of .replace() handles that natively.
+        const matches = content.match(re);
+        if (!matches) continue;
+        count = matches.length;
+        updated = content.replace(re, replacement);
+      } else {
+        // Literal mode: insert replacement exactly as given. A function
+        // replacer means a literal "$1" or "$&" the user typed isn't
+        // mistaken for a backreference (matches edit_file's convention).
+        count = 0;
+        updated = content.replace(re, () => { count++; return replacement; });
+      }
+      if (!count) continue;
+      results.push({ file, rel: path.relative(process.cwd(), file).replace(/\\/g, "/"), updated, count });
+    }
+    if (!results.length) return "(no matches)";
+
+    const totalCount = results.reduce((n, r2) => n + r2.count, 0);
+    const summary = results.map((r2) => `  ${r2.rel} (${r2.count} occurrence${r2.count === 1 ? "" : "s"})`).join("\n");
+
+    if (dry_run) {
+      return `DRY RUN — would replace ${totalCount} occurrence(s) across ${results.length} file(s):\n${summary}`;
+    }
+
+    // Validate every touched path against the workspace boundary before
+    // writing anything — same all-or-nothing discipline as rename_symbol.
+    for (const r2 of results) assertInsideWorkspace(r2.file, "replace target");
+
+    const written = [];
+    try {
+      for (const r2 of results) {
+        fs.writeFileSync(r2.file, r2.updated);
+        written.push(r2.rel);
+      }
+    } catch (e) {
+      throw new Error(
+        `replaced in ${written.length}/${results.length} file(s) before failing: ${e.message}\n` +
+        `Completed: ${written.join(", ") || "(none)"}\n` +
+        `Not written: ${results.slice(written.length).map((r2) => r2.rel).join(", ")}`
+      );
+    }
+    return `Replaced ${totalCount} occurrence(s) across ${results.length} file(s):\n${summary}`;
+  },
+
   find_files({ pattern = ".", path: p = ".", type, max_depth, extension, respect_gitignore = false }) {
     const full = resolve(p);
     if (!fs.existsSync(full)) throw new Error(`Directory not found: ${p}`);
@@ -1086,6 +1214,42 @@ export const impl = {
 
   async lsp({ action, path: p, line, character }) {
     return clip(await lspRequest({ action, path: p, line, character }));
+  },
+
+  async rename_symbol({ path: p, line, character, new_name, dry_run = false }) {
+    const { files, totalEdits } = await lspRenamePlan({ path: p, line, character, newName: new_name });
+    if (!files.length) return "No edits — the server found nothing to rename (wrong position, or the symbol has no other references).";
+
+    // Validate every touched path against the workspace boundary BEFORE
+    // writing anything, exactly like every other write tool — a language
+    // server response is still untrusted input as far as the workspace guard
+    // is concerned. All-or-nothing: if any file fails containment, nothing
+    // is written.
+    for (const f of files) assertInsideWorkspace(f.absPath, "rename target");
+
+    const summary = files.map((f) => `  ${f.relPath} (${f.editCount} edit${f.editCount === 1 ? "" : "s"})`).join("\n");
+    if (dry_run) {
+      return `DRY RUN — would rename across ${files.length} file(s), ${totalEdits} edit(s):\n${summary}`;
+    }
+
+    const written = [];
+    try {
+      for (const f of files) {
+        fs.writeFileSync(f.absPath, f.newContent);
+        written.push(f.relPath);
+      }
+    } catch (e) {
+      // Best-effort report of exactly where a partial failure left things —
+      // no rollback attempt (rare failure mode: e.g. permission denied
+      // partway through), but the user needs to know precisely what state
+      // the workspace is in rather than a bare error.
+      throw new Error(
+        `renamed ${written.length}/${files.length} file(s) before failing: ${e.message}\n` +
+        `Completed: ${written.join(", ") || "(none)"}\n` +
+        `Not written: ${files.slice(written.length).map((f) => f.relPath).join(", ")}`
+      );
+    }
+    return `Renamed across ${files.length} file(s), ${totalEdits} edit(s):\n${summary}`;
   },
 
   test_coverage({ command, timeout_ms = 300000, dry_run = false }) {
